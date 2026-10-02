@@ -7,9 +7,11 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import ScopeViolationError, Service
 
 SCOPE_PATH = "/v1/scope/evaluate"
+MATCH_PATH = "/v1/vulnerabilities/match"
+POST_PATHS = (SCOPE_PATH, MATCH_PATH)
 MAX_BODY_BYTES = 1024 * 1024
 
 
@@ -39,13 +41,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error_json(404, "not_found", f"no route for {self.path}")
 
     def reject_non_post(self) -> None:
-        if self.path == SCOPE_PATH:
+        if self.path in POST_PATHS:
             self.send_error_json(405, "method_not_allowed", "use POST for this route")
             return
         self.send_error(501, "Unsupported method (%r)" % self.command)
 
     def do_GET(self) -> None:
-        if self.path == SCOPE_PATH:
+        if self.path in POST_PATHS:
             self.send_error_json(405, "method_not_allowed", "use POST for this route")
             return
         if self.path == "/healthz":
@@ -54,9 +56,15 @@ class Handler(BaseHTTPRequestHandler):
         self.not_found()
 
     def do_POST(self) -> None:
-        if self.path != SCOPE_PATH:
-            self.not_found()
+        if self.path == SCOPE_PATH:
+            self._handle_json_post(self.service.evaluate_scope)
             return
+        if self.path == MATCH_PATH:
+            self._handle_json_post(self.service.match_vulnerabilities)
+            return
+        self.not_found()
+
+    def _handle_json_post(self, handler) -> None:
         raw_length = self.headers.get("Content-Length")
         if raw_length is None or not raw_length.isdigit():
             self.send_error_json(
@@ -76,7 +84,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(400, "invalid_request", f"malformed JSON: {exc}")
             return
         try:
-            result = self.service.evaluate_scope(payload)
+            result = handler(payload)
+        except ScopeViolationError as exc:
+            self.send_error_json(403, "scope_violation", str(exc))
+            return
         except ValueError as exc:
             self.send_error_json(400, "invalid_request", str(exc))
             return
