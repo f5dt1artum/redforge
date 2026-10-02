@@ -11,7 +11,8 @@ from .service import ScopeViolationError, Service
 
 SCOPE_PATH = "/v1/scope/evaluate"
 MATCH_PATH = "/v1/vulnerabilities/match"
-POST_PATHS = (SCOPE_PATH, MATCH_PATH)
+CONSOLIDATE_PATH = "/v1/findings/consolidate"
+POST_PATHS = (SCOPE_PATH, MATCH_PATH, CONSOLIDATE_PATH)
 MAX_BODY_BYTES = 1024 * 1024
 
 
@@ -61,6 +62,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == MATCH_PATH:
             self._handle_json_post(self.service.match_vulnerabilities)
+            return
+        if self.path == CONSOLIDATE_PATH:
+            self._handle_json_post(self.service.consolidate_findings)
             return
         self.not_found()
 
