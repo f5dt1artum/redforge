@@ -38,6 +38,12 @@ _CONSOLIDATED_FIELDS = frozenset(
         "confidence",
     }
 )
+_REQUIREMENT_FIELDS = frozenset(
+    {"template_id", "min_severity", "min_confidence"}
+)
+_STAGE_FIELDS = frozenset(
+    {"id", "name", "logic", "requires", "depends_on"}
+)
 
 _SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -377,6 +383,69 @@ def _parse_consolidated_item(raw: object, what: str) -> _ConsolidatedItem:
         tuple(evidence),
         confidence,
     )
+
+
+@dataclass(frozen=True)
+class _Requirement:
+    """A validated stage requirement."""
+
+    template_id: str
+    min_severity: str
+    min_confidence: int
+
+
+@dataclass(frozen=True)
+class _Stage:
+    """A validated attack-chain stage.
+
+    depends_on holds the stage ids this stage requires to be ready before it
+    can be ready itself.
+    """
+
+    id: str
+    name: str
+    logic: str
+    requires: tuple[_Requirement, ...]
+    depends_on: tuple[str, ...]
+
+
+def _parse_requirement(raw: object, what: str) -> _Requirement:
+    obj = _require_fields(raw, _REQUIREMENT_FIELDS, what)
+    template_id = _non_empty_str(obj["template_id"], f"{what}.template_id")
+    min_severity = obj["min_severity"]
+    if min_severity not in SEVERITIES:
+        raise ValueError(f"{what}.min_severity must be one of {SEVERITIES}")
+    min_confidence = obj["min_confidence"]
+    if not _is_int(min_confidence) or not 0 <= min_confidence <= 100:
+        raise ValueError(
+            f"{what}.min_confidence must be an integer between 0 and 100"
+        )
+    return _Requirement(template_id, min_severity, min_confidence)
+
+
+def _parse_stage(raw: object, index: int) -> _Stage:
+    what = f"stages[{index}]"
+    obj = _require_fields(raw, _STAGE_FIELDS, what)
+    stage_id = _non_empty_str(obj["id"], f"{what}.id")
+    name = obj["name"]
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{what}.name must be a non-empty string")
+    logic = obj["logic"]
+    if logic not in LOGICS:
+        raise ValueError(f"{what}.logic must be one of {LOGICS}")
+    raw_requires = obj["requires"]
+    if not isinstance(raw_requires, list) or not raw_requires:
+        raise ValueError(f"{what}.requires must be a non-empty array")
+    requires = tuple(
+        _parse_requirement(item, f"{what}.requires[{i}]")
+        for i, item in enumerate(raw_requires)
+    )
+    depends_on = obj["depends_on"]
+    if not isinstance(depends_on, list):
+        raise ValueError(f"{what}.depends_on must be an array")
+    for item in depends_on:
+        _non_empty_str(item, f"{what}.depends_on[]")
+    return _Stage(stage_id, name, logic, requires, tuple(depends_on))
 
 
 def _apply_operator(matcher: _Matcher, text: str) -> bool:
@@ -864,6 +933,165 @@ class Service:
                 "new": new,
             },
         }
+
+    @staticmethod
+    def _validate_stage_graph(stages: list[_Stage]) -> None:
+        """Reject duplicate, self, unknown or cyclic stage dependencies."""
+        ids = {stage.id for stage in stages}
+        for stage in stages:
+            seen: set[str] = set()
+            for dep in stage.depends_on:
+                if dep in seen:
+                    raise ValueError(
+                        f"stage {stage.id!r} lists dependency {dep!r} more "
+                        "than once"
+                    )
+                seen.add(dep)
+                if dep == stage.id:
+                    raise ValueError(f"stage {stage.id!r} depends on itself")
+                if dep not in ids:
+                    raise ValueError(
+                        f"stage {stage.id!r} depends on unknown stage {dep!r}"
+                    )
+        # Kahn's algorithm: a cycle leaves stages with non-zero indegree.
+        indegree = {stage.id: len(stage.depends_on) for stage in stages}
+        dependents: dict[str, list[str]] = {stage.id: [] for stage in stages}
+        for stage in stages:
+            for dep in stage.depends_on:
+                dependents[dep].append(stage.id)
+        pending = [stage.id for stage in stages if indegree[stage.id] == 0]
+        resolved = 0
+        while pending:
+            current = pending.pop(0)
+            resolved += 1
+            for dependent in dependents[current]:
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    pending.append(dependent)
+        if resolved != len(stages):
+            raise ValueError("stages form a dependency cycle")
+
+    @staticmethod
+    def _plan_for_target(
+        stages: list[_Stage],
+        by_template: dict[str, _ConsolidatedItem],
+    ) -> list[dict[str, Any]]:
+        """Evaluate every stage for one target's findings.
+
+        Stages are evaluated in topological order; stages within one
+        evaluation layer keep input order. A stage with satisfied
+        requirements is ready only when every dependency is ready; a failed
+        requirement is reported as missing_requirements even when a
+        dependency is also blocked.
+        """
+        results: dict[str, dict[str, Any]] = {}
+        remaining = list(stages)
+        while remaining:
+            deferred: list[_Stage] = []
+            for stage in remaining:
+                if not all(dep in results for dep in stage.depends_on):
+                    deferred.append(stage)
+                    continue
+                matches = []
+                for requirement in stage.requires:
+                    item = by_template.get(requirement.template_id)
+                    matches.append(
+                        item is not None
+                        and _SEVERITY_RANK[item.severity]
+                        >= _SEVERITY_RANK[requirement.min_severity]
+                        and item.confidence >= requirement.min_confidence
+                    )
+                satisfied = (
+                    all(matches) if stage.logic == "all" else any(matches)
+                )
+                if not satisfied:
+                    status, reason = "skipped", "missing_requirements"
+                elif any(
+                    results[dep]["status"] != "ready" for dep in stage.depends_on
+                ):
+                    status, reason = "skipped", "dependency_blocked"
+                else:
+                    status, reason = "ready", None
+                results[stage.id] = {
+                    "id": stage.id,
+                    "name": stage.name,
+                    "status": status,
+                    "reason": reason,
+                }
+            remaining = deferred
+        return [results[stage.id] for stage in stages]
+
+    def plan_attack_chains(self, payload: object) -> dict[str, Any]:
+        """Plan attack-chain stages from consolidated findings.
+
+        Pure, local evaluation: no network access, no stage execution, no
+        persistent state. All structure is validated and every finding
+        target passes the scope gate before any plan is produced; a single
+        rejection voids the whole request. Raises ValueError on malformed
+        input and ScopeViolationError for any out-of-scope target.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "findings", "stages"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        raw_findings = payload["findings"]
+        if not isinstance(raw_findings, list):
+            raise ValueError("field findings must be an array")
+        findings = [
+            _parse_consolidated_item(raw, f"findings[{i}]")
+            for i, raw in enumerate(raw_findings)
+        ]
+
+        raw_stages = payload["stages"]
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ValueError("field stages must be a non-empty array")
+        stages = [_parse_stage(raw, i) for i, raw in enumerate(raw_stages)]
+        self._require_unique_ids((stage.id for stage in stages), "stage")
+        self._validate_stage_graph(stages)
+
+        seen_keys: set[tuple[str, str]] = set()
+        for item in findings:
+            key = (item.target.text, item.template_id)
+            if key in seen_keys:
+                raise ValueError(
+                    f"duplicate finding key: ({key[0]!r}, {key[1]!r})"
+                )
+            seen_keys.add(key)
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        # Scope gate: every finding target must be authorized before any
+        # plan is produced; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (item.target for item in findings),
+            allow_rules,
+            deny_rules,
+        )
+
+        groups: dict[str, dict[str, _ConsolidatedItem]] = {}
+        order: list[str] = []
+        for item in findings:
+            text = item.target.text
+            if text not in groups:
+                groups[text] = {}
+                order.append(text)
+            groups[text][item.template_id] = item
+
+        plans = [
+            {
+                "target": text,
+                "stages": self._plan_for_target(stages, groups[text]),
+            }
+            for text in order
+        ]
+        return {"plans": plans}
 
     @staticmethod
     def _require_unique_ids(ids: Any, what: str) -> None:
