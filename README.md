@@ -19,6 +19,14 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   先对全部观察目标执行范围评估（任一被拒则整体返回 403 `scope_violation`），再把每个观察与每个模板按
   `all`/`any` 逻辑匹配，响应仅含 `findings`（按观察顺序、再按模板顺序），每项给出 `observation_id`、
   规范化 `target`、`template_id`、`name`、`severity` 和命中匹配器下标 `evidence`。
+- `POST /v1/findings/consolidate`：离线汇总多次扫描的匹配结果。请求体含 `allow`、`deny`、非空 `runs`；
+  每个 run 含唯一非空 `id`、0–100 的整数 `reliability` 和 `findings` 数组（字段同 match 的发现）。
+  先规范化并授权检查全部 finding 的 target（任一被拒则整体 403 `scope_violation`），再以
+  「规范化 target + 区分大小写的 template_id」为键，按首次出现顺序合并：`name` 保留首次值
+  （同键不同 name 视为 400 `invalid_request`），`severity` 取最高，`observation_ids`/`sources`
+  按首次出现顺序去重，`evidence` 合并为升序去重的非负整数。`confidence` 对每个含该键的不同 run
+  只计一次，按 runs 顺序以 `c=c+floor((100-c)*reliability/100)` 从 0 迭代（整数）；同一 run 内的
+  重复发现仍参与观察编号与证据合并。响应仅含 `consolidated`，无发现时为空数组。纯本地计算，不落盘。
 
 ## 验证
 

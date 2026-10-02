@@ -22,6 +22,10 @@ OPERATORS = ("equals", "contains", "regex")
 
 _OBSERVATION_FIELDS = frozenset({"id", "target", "status", "headers", "body"})
 _TEMPLATE_FIELDS = frozenset({"id", "name", "severity", "logic", "matchers"})
+_RUN_FIELDS = frozenset({"id", "reliability", "findings"})
+_FINDING_FIELDS = frozenset(
+    {"observation_id", "target", "template_id", "name", "severity", "evidence"}
+)
 
 _LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
@@ -268,6 +272,38 @@ def _parse_observation(raw: object, index: int) -> _Observation:
     return _Observation(observation_id, target, status, dict(headers), body)
 
 
+@dataclass(frozen=True)
+class _RunFinding:
+    """A validated finding carried inside a consolidation run."""
+
+    observation_id: str
+    target: _Entry
+    template_id: str
+    name: str
+    severity: str
+    evidence: list[int]
+
+
+def _parse_run_finding(raw: object, path: str) -> _RunFinding:
+    obj = _require_fields(raw, _FINDING_FIELDS, path)
+    observation_id = _non_empty_str(obj["observation_id"], f"{path}.observation_id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    template_id = _non_empty_str(obj["template_id"], f"{path}.template_id")
+    name = _non_empty_str(obj["name"], f"{path}.name")
+    severity = obj["severity"]
+    if severity not in SEVERITIES:
+        raise ValueError(f"{path}.severity must be one of {SEVERITIES}")
+    evidence = obj["evidence"]
+    if not isinstance(evidence, list):
+        raise ValueError(f"{path}.evidence must be an array")
+    for item in evidence:
+        if not _is_int(item) or item < 0:
+            raise ValueError(f"{path}.evidence must contain only non-negative integers")
+    return _RunFinding(
+        observation_id, target, template_id, name, severity, list(evidence)
+    )
+
+
 def _apply_operator(matcher: _Matcher, text: str) -> bool:
     if matcher.operator == "equals":
         return text == matcher.value
@@ -467,6 +503,145 @@ class Service:
                         }
                     )
         return {"findings": findings}
+
+    def consolidate_findings(self, payload: object) -> dict[str, Any]:
+        """Consolidate matched findings from several scan runs.
+
+        Pure, local evaluation: no network access, no persistent state. Every
+        finding target is checked against the allow/deny scope before any
+        consolidation happens. Raises ValueError on malformed input and
+        ScopeViolationError when any target is out of scope; never returns
+        partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "runs"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        for key in ("allow", "deny"):
+            value = payload[key]
+            if not isinstance(value, list):
+                raise ValueError(f"field {key} must be an array")
+            if len(value) > MAX_RULES_PER_FIELD:
+                raise ValueError(
+                    f"field {key} exceeds {MAX_RULES_PER_FIELD} entries"
+                )
+        allow_rules = [
+            _parse_entry(raw, allow_wildcard=True) for raw in payload["allow"]
+        ]
+        deny_rules = [
+            _parse_entry(raw, allow_wildcard=True) for raw in payload["deny"]
+        ]
+
+        runs_raw = payload["runs"]
+        if not isinstance(runs_raw, list) or not runs_raw:
+            raise ValueError("field runs must be a non-empty array")
+
+        runs: list[tuple[str, int, list[_RunFinding]]] = []
+        seen_run_ids: set[str] = set()
+        for i, raw_run in enumerate(runs_raw):
+            what = f"runs[{i}]"
+            obj = _require_fields(raw_run, _RUN_FIELDS, what)
+            run_id = _non_empty_str(obj["id"], f"{what}.id")
+            if run_id in seen_run_ids:
+                raise ValueError(f"duplicate run id: {run_id!r}")
+            seen_run_ids.add(run_id)
+            reliability = obj["reliability"]
+            if not _is_int(reliability) or not 0 <= reliability <= 100:
+                raise ValueError(
+                    f"{what}.reliability must be an integer between 0 and 100"
+                )
+            findings_raw = obj["findings"]
+            if not isinstance(findings_raw, list):
+                raise ValueError(f"{what}.findings must be an array")
+            findings = [
+                _parse_run_finding(raw, f"{what}.findings[{j}]")
+                for j, raw in enumerate(findings_raw)
+            ]
+            runs.append((run_id, reliability, findings))
+
+        # Scope gate: every finding target must be authorized before any
+        # consolidation happens; a single rejection voids the whole request.
+        for _, _, findings in runs:
+            for finding in findings:
+                allowed, reason, _ = self._evaluate(
+                    finding.target, allow_rules, deny_rules
+                )
+                if not allowed:
+                    raise ScopeViolationError(
+                        f"target {finding.target.text} out of scope: {reason}"
+                    )
+
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+        order: list[tuple[str, str]] = []
+        for _, _, findings in runs:
+            for finding in findings:
+                key = (finding.target.text, finding.template_id)
+                group = groups.get(key)
+                if group is None:
+                    group = {
+                        "name": finding.name,
+                        "severity": finding.severity,
+                        "observation_ids": [],
+                        "_observation_seen": set(),
+                        "sources": [],
+                        "evidence": set(),
+                        "confidence": 0,
+                    }
+                    groups[key] = group
+                    order.append(key)
+                elif group["name"] != finding.name:
+                    raise ValueError(
+                        "findings with the same target and template_id must "
+                        f"share a name: {finding.template_id!r}"
+                    )
+                if (
+                    SEVERITIES.index(finding.severity)
+                    > SEVERITIES.index(group["severity"])
+                ):
+                    group["severity"] = finding.severity
+                if finding.observation_id not in group["_observation_seen"]:
+                    group["_observation_seen"].add(finding.observation_id)
+                    group["observation_ids"].append(finding.observation_id)
+                group["evidence"].update(finding.evidence)
+
+        # Sources and confidence count each distinct run at most once, walks
+        # runs in order; observation ids and evidence still absorb in-run
+        # duplicates from the pass above.
+        for run_id, reliability, findings in runs:
+            run_keys = {
+                (finding.target.text, finding.template_id) for finding in findings
+            }
+            for key in run_keys:
+                group = groups[key]
+                group["sources"].append(run_id)
+                confidence = group["confidence"]
+                group["confidence"] = (
+                    confidence + (100 - confidence) * reliability // 100
+                )
+
+        consolidated: list[dict[str, Any]] = []
+        for key in order:
+            group = groups[key]
+            consolidated.append(
+                {
+                    "target": key[0],
+                    "template_id": key[1],
+                    "name": group["name"],
+                    "severity": group["severity"],
+                    "observation_ids": group["observation_ids"],
+                    "sources": group["sources"],
+                    "evidence": sorted(group["evidence"]),
+                    "confidence": group["confidence"],
+                }
+            )
+        return {"consolidated": consolidated}
 
     @staticmethod
     def _require_unique_ids(ids: Any, what: str) -> None:
