@@ -12,6 +12,18 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
 
 服务默认监听 `127.0.0.1:8080`，可通过 `REDFORGE_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。
 
+## 离线漏洞模板匹配
+
+`POST /v1/vulnerabilities/match` 把已采集的 HTTP 观察与漏洞模板做纯本地匹配，不访问目标网络。请求体包含 `allow`、`deny`（沿用 `/v1/scope/evaluate` 的范围规则）、非空数组 `templates` 和 `observations`：
+
+- 观察：唯一非空 `id`、`target`、100–599 的整数 `status`、字符串键值 `headers`、字符串 `body`。
+- 模板：唯一非空 `id`、`name`、`severity`（`info`/`low`/`medium`/`high`/`critical`）、`logic`（`all`/`any`）、非空 `matchers`。
+- 匹配器：`status`（`values` 非空整数数组）、`header`（`name`/`operator`/`value`，头名称不区分大小写）、`body`（`operator`/`value`）。`operator` 为 `equals`、`contains`（区分大小写的完整相等/子串）或 `regex`（Unicode 正则搜索）。
+
+匹配前先用全部观察的 `target` 执行范围评估，任一目标被拒绝则整体返回 `403 scope_violation`，不返回部分结果。结构或类型不符、数组为空、`id` 重复、枚举非法、状态码越界、匹配值为空、正则非法时返回 `400 invalid_request`；请求体超过 1 MiB 返回 `413`。
+
+响应仅含 `findings`，按观察顺序再按模板顺序列出命中组合；每项包含 `observation_id`、规范化 `target`、`template_id`、`name`、`severity` 与 `evidence`（按原次序的全部命中匹配器下标，未命中不占位）。
+
 ## 验证
 
 ```bash

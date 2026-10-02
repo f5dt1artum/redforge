@@ -7,9 +7,11 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import ScopeViolation, Service
 
 SCOPE_PATH = "/v1/scope/evaluate"
+VULN_MATCH_PATH = "/v1/vulnerabilities/match"
+POST_ROUTES = (SCOPE_PATH, VULN_MATCH_PATH)
 MAX_BODY_BYTES = 1024 * 1024
 
 
@@ -39,13 +41,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error_json(404, "not_found", f"no route for {self.path}")
 
     def reject_non_post(self) -> None:
-        if self.path == SCOPE_PATH:
+        if self.path in POST_ROUTES:
             self.send_error_json(405, "method_not_allowed", "use POST for this route")
             return
         self.send_error(501, "Unsupported method (%r)" % self.command)
 
     def do_GET(self) -> None:
-        if self.path == SCOPE_PATH:
+        if self.path in POST_ROUTES:
             self.send_error_json(405, "method_not_allowed", "use POST for this route")
             return
         if self.path == "/healthz":
@@ -53,30 +55,42 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.not_found()
 
-    def do_POST(self) -> None:
-        if self.path != SCOPE_PATH:
-            self.not_found()
-            return
+    def read_json_body(self) -> object | None:
+        """Read and decode the request body, or None after an error reply."""
         raw_length = self.headers.get("Content-Length")
         if raw_length is None or not raw_length.isdigit():
             self.send_error_json(
                 400, "invalid_request", "missing or invalid Content-Length"
             )
-            return
+            return None
         length = int(raw_length)
         if length > MAX_BODY_BYTES:
             # Do not drain an oversized body; drop the connection instead.
             self.close_connection = True
             self.send_error_json(413, "request_too_large", "body exceeds 1 MiB")
-            return
+            return None
         body = self.rfile.read(length)
         try:
-            payload = json.loads(body)
+            return json.loads(body)
         except (ValueError, UnicodeDecodeError) as exc:
             self.send_error_json(400, "invalid_request", f"malformed JSON: {exc}")
+            return None
+
+    def do_POST(self) -> None:
+        if self.path not in POST_ROUTES:
+            self.not_found()
+            return
+        payload = self.read_json_body()
+        if payload is None:
             return
         try:
-            result = self.service.evaluate_scope(payload)
+            if self.path == SCOPE_PATH:
+                result = self.service.evaluate_scope(payload)
+            else:
+                result = self.service.match_vulnerabilities(payload)
+        except ScopeViolation as exc:
+            self.send_error_json(403, "scope_violation", str(exc))
+            return
         except ValueError as exc:
             self.send_error_json(400, "invalid_request", str(exc))
             return
