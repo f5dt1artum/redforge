@@ -9,6 +9,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .service import Service
 
+SCOPE_PATH = "/v1/scope/evaluate"
+MAX_BODY_BYTES = 1024 * 1024  # 1 MiB
+
 
 def env_address() -> tuple[str, int]:
     raw = os.environ.get("REDFORGE_ADDR", "127.0.0.1:8080")
@@ -29,11 +32,72 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _not_found(self) -> None:
+        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def _method_not_allowed(self) -> None:
+        self.send_json(
+            405,
+            {"error": {"code": "method_not_allowed", "message": f"method {self.command} not allowed for {self.path}"}},
+        )
+
+    def _reject_other_methods(self) -> None:
+        if self.path == SCOPE_PATH:
+            self._method_not_allowed()
+        else:
+            self._not_found()
+
     def do_GET(self) -> None:
+        if self.path == SCOPE_PATH:
+            self._method_not_allowed()
+            return
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
-        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+        self._not_found()
+
+    do_PUT = _reject_other_methods
+    do_DELETE = _reject_other_methods
+    do_PATCH = _reject_other_methods
+    do_HEAD = _reject_other_methods
+    do_OPTIONS = _reject_other_methods
+
+    def do_POST(self) -> None:
+        if self.path != SCOPE_PATH:
+            self._not_found()
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length < 0:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True
+            self.send_json(
+                413,
+                {"error": {"code": "request_too_large", "message": "request body exceeds 1 MiB"}},
+            )
+            return
+        body = self.rfile.read(length) if length else b""
+        if len(body) > MAX_BODY_BYTES:
+            self.close_connection = True
+            self.send_json(
+                413,
+                {"error": {"code": "request_too_large", "message": "request body exceeds 1 MiB"}},
+            )
+            return
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            self.send_json(400, {"error": {"code": "invalid_request", "message": "request body is not valid JSON"}})
+            return
+        try:
+            result = self.service.evaluate_scope(payload)
+        except ValueError as exc:
+            self.send_json(400, {"error": {"code": "invalid_request", "message": str(exc)}})
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
