@@ -26,6 +26,18 @@ _FINDING_FIELDS = frozenset(
     {"observation_id", "target", "template_id", "name", "severity", "evidence"}
 )
 _RUN_FIELDS = frozenset({"id", "reliability", "findings"})
+_CONSOLIDATED_FIELDS = frozenset(
+    {
+        "target",
+        "template_id",
+        "name",
+        "severity",
+        "observation_ids",
+        "sources",
+        "evidence",
+        "confidence",
+    }
+)
 
 _SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -508,26 +520,9 @@ class Service:
                     )
         return {"findings": findings}
 
-    def consolidate_findings(self, payload: object) -> dict[str, Any]:
-        """Consolidate matched findings collected across multiple scans.
-
-        Pure, local evaluation: no network access, no persistent state. The
-        allow/deny rules gate every finding target first (any unauthorized
-        target raises ScopeViolationError); findings are then de-duplicated by
-        normalized target and case-sensitive template_id. Raises ValueError
-        on any malformed input; never returns partial results.
-        """
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be an object")
-        required = {"allow", "deny", "runs"}
-        keys = set(payload)
-        missing = required - keys
-        if missing:
-            raise ValueError(f"missing field: {sorted(missing)[0]}")
-        extra = keys - required
-        if extra:
-            raise ValueError(f"unknown field: {sorted(extra)[0]}")
-
+    def _parse_allow_deny(
+        self, payload: dict[str, Any]
+    ) -> tuple[list[_Entry], list[_Entry]]:
         for key in ("allow", "deny"):
             value = payload[key]
             if not isinstance(value, list):
@@ -542,11 +537,13 @@ class Service:
         deny_rules = [
             _parse_entry(raw, allow_wildcard=True) for raw in payload["deny"]
         ]
+        return allow_rules, deny_rules
 
-        raw_runs = payload["runs"]
+    def _parse_runs(
+        self, raw_runs: object
+    ) -> list[tuple[str, int, list[_Finding]]]:
         if not isinstance(raw_runs, list) or not raw_runs:
             raise ValueError("field runs must be a non-empty array")
-
         runs: list[tuple[str, int, list[_Finding]]] = []
         seen_run_ids: set[str] = set()
         for i, raw_run in enumerate(raw_runs):
@@ -569,19 +566,26 @@ class Service:
                 for j, raw in enumerate(raw_findings)
             ]
             runs.append((run_id, reliability, findings))
+        return runs
 
-        # Scope gate: every finding target must be authorized before any
-        # consolidation happens; a single rejection voids the whole request.
-        for _, _, findings in runs:
-            for finding in findings:
-                allowed, reason, _ = self._evaluate(
-                    finding.target, allow_rules, deny_rules
+    def _gate_scope(
+        self,
+        targets: list[_Entry],
+        allow_rules: list[_Entry],
+        deny_rules: list[_Entry],
+    ) -> None:
+        """Raise ScopeViolationError on the first unauthorized target."""
+        for target in targets:
+            allowed, reason, _ = self._evaluate(target, allow_rules, deny_rules)
+            if not allowed:
+                raise ScopeViolationError(
+                    f"target {target.text} out of scope: {reason}"
                 )
-                if not allowed:
-                    raise ScopeViolationError(
-                        f"target {finding.target.text} out of scope: {reason}"
-                    )
 
+    def _consolidate(
+        self, runs: list[tuple[str, int, list[_Finding]]]
+    ) -> list[dict[str, Any]]:
+        """De-duplicate validated findings using existing consolidate rules."""
         groups: dict[tuple[str, str], dict[str, Any]] = {}
         order: list[tuple[str, str]] = []
         for _, _, findings in runs:
@@ -645,7 +649,213 @@ class Service:
                     "confidence": group["confidence"],
                 }
             )
-        return {"consolidated": consolidated}
+        return consolidated
+
+    def consolidate_findings(self, payload: object) -> dict[str, Any]:
+        """Consolidate matched findings collected across multiple scans.
+
+        Pure, local evaluation: no network access, no persistent state. The
+        allow/deny rules gate every finding target first (any unauthorized
+        target raises ScopeViolationError); findings are then de-duplicated by
+        normalized target and case-sensitive template_id. Raises ValueError
+        on any malformed input; never returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "runs"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_allow_deny(payload)
+        runs = self._parse_runs(payload["runs"])
+
+        # Scope gate: every finding target must be authorized before any
+        # consolidation happens; a single rejection voids the whole request.
+        self._gate_scope(
+            [finding.target for _, _, findings in runs for finding in findings],
+            allow_rules,
+            deny_rules,
+        )
+        return {"consolidated": self._consolidate(runs)}
+
+    @staticmethod
+    def _parse_str_list(
+        raw: object, what: str, *, allow_empty: bool
+    ) -> list[str]:
+        if not isinstance(raw, list):
+            raise ValueError(f"{what} must be an array")
+        if not allow_empty and not raw:
+            raise ValueError(f"{what} must be a non-empty array")
+        result: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item:
+                raise ValueError(f"{what} must contain only non-empty strings")
+            result.append(item)
+        return result
+
+    def _parse_consolidated_item(self, raw: object, index: int) -> dict[str, Any]:
+        """Validate one item shaped like a consolidate response element."""
+        what = f"baseline[{index}]"
+        obj = _require_fields(raw, _CONSOLIDATED_FIELDS, what)
+        target_entry = _parse_entry(obj["target"], allow_wildcard=False)
+        template_id = _non_empty_str(obj["template_id"], f"{what}.template_id")
+        name = obj["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{what}.name must be a non-empty string")
+        severity = obj["severity"]
+        if severity not in SEVERITIES:
+            raise ValueError(f"{what}.severity must be one of {SEVERITIES}")
+        observation_ids = self._parse_str_list(
+            obj["observation_ids"], f"{what}.observation_ids", allow_empty=False
+        )
+        sources = self._parse_str_list(
+            obj["sources"], f"{what}.sources", allow_empty=False
+        )
+        evidence = obj["evidence"]
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError(f"{what}.evidence must be a non-empty array")
+        for item in evidence:
+            if not _is_int(item) or item < 0:
+                raise ValueError(
+                    f"{what}.evidence must contain only non-negative integers"
+                )
+        confidence = obj["confidence"]
+        if not _is_int(confidence) or not 0 <= confidence <= 100:
+            raise ValueError(
+                f"{what}.confidence must be an integer between 0 and 100"
+            )
+        return {
+            "target": target_entry.text,
+            "_target_entry": target_entry,
+            "template_id": template_id,
+            "raw": obj,
+        }
+
+    def retest_findings(self, payload: object) -> dict[str, Any]:
+        """Compare a fresh consolidation against a previously consolidated one.
+
+        Pure, local evaluation: no network access, no persistent state. The
+        request carries the same allow/deny rules, a ``baseline`` shaped like a
+        prior consolidate response's ``consolidated`` array (possibly empty),
+        and non-empty ``retest_runs`` shaped like consolidate's ``runs``.
+
+        Every structure is validated first; then every target on both sides is
+        scope-gated (any rejection raises ScopeViolationError and suppresses
+        comparison). Items are matched by normalized target and case-sensitive
+        template_id into persistent / resolved / new comparisons. Raises
+        ValueError on any malformed input; never returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "baseline", "retest_runs"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_allow_deny(payload)
+
+        raw_baseline = payload["baseline"]
+        if not isinstance(raw_baseline, list):
+            raise ValueError("field baseline must be an array")
+        baseline_items = [
+            self._parse_consolidated_item(raw, i)
+            for i, raw in enumerate(raw_baseline)
+        ]
+        runs = self._parse_runs(payload["retest_runs"])
+
+        # Structural validation of the request and baseline finishes first;
+        # duplicate baseline keys are part of that validation.
+        baseline_keys: list[tuple[str, str]] = []
+        baseline_map: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in baseline_items:
+            key = (item["target"], item["template_id"])
+            if key in baseline_map:
+                raise ValueError(
+                    f"duplicate baseline key: target={key[0]!r}, "
+                    f"template_id={key[1]!r}"
+                )
+            baseline_map[key] = item
+            baseline_keys.append(key)
+
+        # Scope gate comes before this round's result is produced: every
+        # target on both sides is checked and one rejection voids the request.
+        self._gate_scope(
+            [item["_target_entry"] for item in baseline_items]
+            + [
+                finding.target
+                for _, _, findings in runs
+                for finding in findings
+            ],
+            allow_rules,
+            deny_rules,
+        )
+
+        # Only after the gate passes do consolidation semantics run, which is
+        # where same-key name conflicts surface as invalid_request.
+        retest = self._consolidate(runs)
+        retest_map = {
+            (item["target"], item["template_id"]): item for item in retest
+        }
+
+        comparisons: list[dict[str, Any]] = []
+        persistent = resolved = new = 0
+        # Baseline order first: same key is persistent, a missing key resolved.
+        # Field-level changes never alter the status; baseline name wins.
+        for key in baseline_keys:
+            before = baseline_map[key]
+            after = retest_map.get(key)
+            if after is None:
+                status = "resolved"
+                resolved += 1
+            else:
+                status = "persistent"
+                persistent += 1
+            comparisons.append(
+                {
+                    "target": key[0],
+                    "template_id": key[1],
+                    "name": before["raw"]["name"],
+                    "status": status,
+                    "before": before["raw"],
+                    "after": after,
+                }
+            )
+        # New keys follow in the retest consolidation's first-seen order.
+        for item in retest:
+            key = (item["target"], item["template_id"])
+            if key in baseline_map:
+                continue
+            new += 1
+            comparisons.append(
+                {
+                    "target": key[0],
+                    "template_id": key[1],
+                    "name": item["name"],
+                    "status": "new",
+                    "before": None,
+                    "after": item,
+                }
+            )
+
+        return {
+            "comparisons": comparisons,
+            "summary": {
+                "total_before": len(baseline_keys),
+                "total_after": len(retest),
+                "persistent": persistent,
+                "resolved": resolved,
+                "new": new,
+            },
+        }
 
     @staticmethod
     def _require_unique_ids(ids: Any, what: str) -> None:
