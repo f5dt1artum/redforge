@@ -40,6 +40,19 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `before`、`after`（两侧为完整汇总项，缺失为 `null`；字段变化不改变状态）。summary 只含
   `total_before`、`total_after`、`persistent`、`resolved`、`new` 五个一致整数。空 baseline 可产生
   `new`；复测无发现时 baseline 项全部为 `resolved`；同一输入数组顺序稳定。
+- `POST /v1/attack-chains/plan`：按目标规划攻击链阶段，纯本地处理，不执行阶段、不持久化。请求体仅含
+  `allow`、`deny`、`findings`、`stages`；`findings` 与 consolidate 响应的 `consolidated` 数组同形且可为空，
+  `stages` 为非空数组，每个阶段含非空 `id`（唯一）、`name`、`logic`（`all`/`any`）、非空 `requires`
+  （每项仅含 `template_id`、`min_severity`、`min_confidence`，后者为 0–100 的非布尔整数）和
+  `depends_on`（阶段 id 数组，不得重复、自指、引用未知 id 或成环）。先完成全部结构校验（finding 的规范化
+  `target` 与 `template_id` 组合重复、阶段 id 重复或依赖无效均为 400 `invalid_request`），再对全部
+  finding 的规范化 `target` 执行范围评估，任一越界则整体返回 403 `scope_violation`，不返回局部计划。
+  通过后按规范化 `target` 分组（目标保持首次出现顺序），条件仅匹配同一目标下 `template_id` 大小写一致、
+  `severity` 与 `confidence` 均达门槛的发现项；阶段按拓扑顺序评估（同层保持输入顺序），自身条件成立且
+  所有依赖均为 `ready` 时状态为 `ready`（`reason` 为 `null`），条件不成立时为 `skipped` 且原因为
+  `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
+  每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
+  `findings` 返回空 `plans`，相同输入的数组顺序稳定。
 
 ## 验证
 
