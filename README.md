@@ -53,6 +53,20 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
   每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
   `findings` 返回空 `plans`，相同输入的数组顺序稳定。
+- `POST /v1/assets/fingerprint`：把端口观测整理为服务资产，纯本地识别，不联网、不持久化。请求体仅含
+  `allow`、`deny`、`fingerprints`、`observations`，后两项可为空数组。observation 仅含唯一非空 `id`、
+  沿用既有语法的 `target`、1–65535 的非布尔整数 `port`、仅限 `tcp`/`udp` 的 `transport` 和字符串
+  `banner`。fingerprint 仅含唯一非空 `id`、非空 `name` 与 `service`、非布尔整数 `priority`、
+  `all`/`any` 的 `logic` 和非空 `matchers`；匹配器只能是 `ports`（无重复的有效端口数组）、
+  `transport`（`tcp`/`udp`）或 `operator`+非空 `value` 的 banner 检查（`equals`/`contains`/`regex`，
+  文本比较区分大小写，regex 为搜索语义，非法表达式为 400）。`all` 要求全部命中，`any` 要求至少一个
+  命中；多指纹命中时选 `priority` 最大者，并列取输入靠前者，`evidence` 按命中匹配器下标升序。先完成
+  全部结构校验（结构错误、重复 id、规范化 `target`/`transport`/`port` 相同的重复端点均返回 400
+  `invalid_request`），再对全部观测目标执行范围评估，任一越界则整体返回 403 `scope_violation`。
+  成功响应仅含 `assets`，按目标首次出现顺序分组，每项含规范化 `target` 和保持观测顺序的 `services`
+  （每项含 `observation_id`、`port`、`transport`、`service`、`fingerprint_id`、`name`、`evidence`）；
+  未命中时 `service` 为 `unknown`，`fingerprint_id` 与 `name` 为 `null`，`evidence` 为空数组；空
+  `observations` 返回空 `assets`，相同输入内容与顺序稳定。
 - `POST /v1/reports/export`：把既有结果导出为单一稳定的证据报告，纯本地处理。请求体仅含 `allow`、`deny`、
   `title`、`findings`、`comparisons`、`plans`；`title` 为非空字符串，后三项分别沿用 consolidate、retest 和
   attack-chains/plan 的结果项，均为可空数组。先完成结构及交叉一致性校验：以规范化 `target` 与区分大小写的
