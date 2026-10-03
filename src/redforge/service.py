@@ -84,6 +84,9 @@ _RATE_LIMIT_POLICY_FIELDS = frozenset({"window_ms", "max_requests", "group_by"})
 _RATE_LIMIT_ATTEMPT_FIELDS = frozenset(
     {"id", "target", "route", "identity", "timestamp_ms"}
 )
+_SCHEDULE_REQUEST_FIELDS = frozenset(
+    {"id", "target", "route", "earliest_ms", "depends_on"}
+)
 
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
@@ -1108,6 +1111,53 @@ def _parse_rate_limit_attempt(raw: object, index: int) -> _RateLimitAttempt:
     if not _is_int(timestamp_ms) or timestamp_ms < 0:
         raise ValueError(f"{what}.timestamp_ms must be a non-negative integer")
     return _RateLimitAttempt(attempt_id, target, route, identity, timestamp_ms)
+
+
+@dataclass(frozen=True)
+class _ScheduledRequest:
+    """A validated request to schedule.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in the schedule.
+    """
+
+    id: str
+    target: _Entry
+    route: str
+    earliest_ms: int
+    depends_on: tuple[str, ...]
+
+
+def _parse_scheduled_request(raw: object, index: int) -> _ScheduledRequest:
+    what = f"requests[{index}]"
+    obj = _require_fields(raw, _SCHEDULE_REQUEST_FIELDS, what)
+    request_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    route = obj["route"]
+    if not isinstance(route, str) or not route.startswith("/"):
+        raise ValueError(
+            f"{what}.route must be a non-empty string starting with '/'"
+        )
+    earliest_ms = obj["earliest_ms"]
+    if not _is_int(earliest_ms) or earliest_ms < 0:
+        raise ValueError(f"{what}.earliest_ms must be a non-negative integer")
+    raw_depends_on = obj["depends_on"]
+    if not isinstance(raw_depends_on, list):
+        raise ValueError(f"{what}.depends_on must be an array")
+    depends_on: list[str] = []
+    seen_deps: set[str] = set()
+    for dep in raw_depends_on:
+        if not isinstance(dep, str) or not dep:
+            raise ValueError(
+                f"{what}.depends_on must contain only non-empty strings"
+            )
+        if dep in seen_deps:
+            raise ValueError(f"{what}.depends_on has duplicate entry: {dep!r}")
+        seen_deps.add(dep)
+        depends_on.append(dep)
+    return _ScheduledRequest(
+        request_id, target, route, earliest_ms, tuple(depends_on)
+    )
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2553,3 +2603,154 @@ class Service:
         for alert in alerts:
             del alert["_sort"]
         return alerts
+
+    def schedule_requests(self, payload: object) -> dict[str, Any]:
+        """Compute the earliest compliant execution time for pending requests.
+
+        Pure, local evaluation: no network access, no request dispatch, no
+        payload execution, and no persistent state. All structure is
+        validated first (including duplicate ids, unknown or duplicate
+        dependencies, self-dependencies, and dependency cycles); only then
+        are request targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns a partial schedule. The same input
+        always produces the same schedule.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "policy", "requests"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        policy = _parse_rate_limit_policy(payload["policy"])
+
+        raw_requests = payload["requests"]
+        if not isinstance(raw_requests, list):
+            raise ValueError("field requests must be an array")
+        requests = [
+            _parse_scheduled_request(raw, i) for i, raw in enumerate(raw_requests)
+        ]
+        self._require_unique_ids(
+            (request.id for request in requests), "request"
+        )
+        # Structural validation of the dependency graph (unknown ids,
+        # self-dependencies, cycles) finishes before the scope gate.
+        ordered_requests = self._resolve_request_order(requests)
+
+        # Scope gate: every request target must be authorized before any
+        # scheduling happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (request.target for request in requests),
+            allow_rules,
+            deny_rules,
+        )
+
+        schedule = self._build_schedule(
+            ordered_requests, policy, {r.id: i for i, r in enumerate(requests)}
+        )
+        # Report by scheduled_ms ascending; ties keep the stable topological
+        # (input-position respecting) order.
+        schedule.sort(key=lambda item: (item["scheduled_ms"], item["_pos"]))
+        for item in schedule:
+            del item["_pos"]
+        return {"schedule": schedule}
+
+    @staticmethod
+    def _resolve_request_order(
+        requests: list[_ScheduledRequest],
+    ) -> list[_ScheduledRequest]:
+        """Topologically order requests; same level keeps input order.
+
+        Raises ValueError on self-references, unknown ids, or cycles.
+        """
+        known = {request.id for request in requests}
+        for request in requests:
+            for dep in request.depends_on:
+                if dep == request.id:
+                    raise ValueError(
+                        f"request {request.id!r} depends on itself"
+                    )
+                if dep not in known:
+                    raise ValueError(
+                        f"request {request.id!r} depends on unknown id: "
+                        f"{dep!r}"
+                    )
+        remaining = list(requests)
+        done: set[str] = set()
+        ordered: list[_ScheduledRequest] = []
+        while remaining:
+            ready_now = [
+                request
+                for request in remaining
+                if all(dep in done for dep in request.depends_on)
+            ]
+            if not ready_now:
+                raise ValueError("request dependencies form a cycle")
+            for request in ready_now:
+                done.add(request.id)
+            ordered.extend(ready_now)
+            remaining = [
+                request for request in remaining if request.id not in done
+            ]
+        return ordered
+
+    @staticmethod
+    def _build_schedule(
+        ordered_requests: list[_ScheduledRequest],
+        policy: _RateLimitPolicy,
+        input_positions: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        """Place each request into the earliest non-saturated fixed window.
+
+        Candidates are walked in stable topological order, so input position
+        decides every occupancy tie. Per group, each fixed window holds at
+        most max_requests placements; a full window pushes the request to
+        the next window start.
+        """
+        window_ms = policy.window_ms
+        max_requests = policy.max_requests
+        scheduled_at: dict[str, int] = {}
+        # group -> {window_start: [request id, ...]} in placement order.
+        occupancy: dict[Any, dict[int, list[str]]] = {}
+        results: list[dict[str, Any]] = []
+
+        for request in ordered_requests:
+            candidate = request.earliest_ms
+            for dep in request.depends_on:
+                if scheduled_at[dep] > candidate:
+                    candidate = scheduled_at[dep]
+            group: Any
+            if policy.group_by == "target_route":
+                group = (request.target.text, request.route)
+            else:
+                group = request.target.text
+            group_windows = occupancy.setdefault(group, {})
+            window_start = (candidate // window_ms) * window_ms
+            candidate_window = window_start
+            while len(group_windows.get(window_start, ())) >= max_requests:
+                window_start += window_ms
+            group_windows.setdefault(window_start, []).append(request.id)
+            # Room in the candidate's own window: execute at the candidate
+            # time; a bumped request executes at the next window start.
+            scheduled_ms = (
+                candidate if window_start == candidate_window else window_start
+            )
+            scheduled_at[request.id] = scheduled_ms
+            results.append(
+                {
+                    "id": request.id,
+                    "target": request.target.text,
+                    "route": request.route,
+                    "scheduled_ms": scheduled_ms,
+                    "window_start_ms": window_start,
+                    "depends_on": list(request.depends_on),
+                    "_pos": input_positions[request.id],
+                }
+            )
+        return results

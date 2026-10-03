@@ -141,6 +141,21 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `window_ms`）、`total_requests`、`identity_counts`（按身份首次出现顺序给出 `identity` 与 `count`）、
   `kind`、`attempt_ids`（按 `timestamp_ms` 升序，并列按输入顺序）。空 `attempts` 或无超限时返回空
   `alerts`；相同输入始终产生相同结果。
+- `POST /v1/requests/schedule`：在请求发出前离线计算待执行请求的最早可用时间，不发送请求、不执行载荷、
+  不联网、不持久化。请求体仅含 `allow`、`deny`、`policy`、`requests`；`policy` 沿用限速分析的规则
+  （`window_ms`、`max_requests` 为正的非布尔整数，`group_by` 仅 `target` 或 `target_route`）；
+  `requests` 可为空数组，每项仅含唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、以 `/`
+  开头的非空 `route`、非负非布尔整数 `earliest_ms` 和无重复请求 id 数组 `depends_on`，不接受多余字段。
+  先完成全部结构校验（字段缺失或多余、类型或数值非法、重复 `id`、依赖未知或重复、自依赖、依赖成环及
+  非法范围规则均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个 `target` 的规范化形式，
+  任一未获授权则整体返回 403 `scope_violation`，不返回部分计划；空 `requests` 仍校验 policy 与范围规则并
+  返回空计划。编排采用稳定拓扑顺序（同层按输入位置靠前优先）；每个请求的候选时间取其 `earliest_ms` 与
+  全部依赖项 `scheduled_ms` 的最大值，再寻找所属分组中尚未达到 `max_requests` 的最早固定窗口——窗口起点按
+  `floor(timestamp_ms / window_ms) * window_ms` 计算，窗口已满则移至下一窗口起点。`group_by` 为 `target`
+  时规范化目标共享限额，为 `target_route` 时按区分大小写的 `route` 分组。成功响应仅含 `schedule`，按
+  `scheduled_ms` 升序排列，并列保持输入顺序；每项仅含 `id`、规范化 `target`、`route`、`scheduled_ms`、
+  `window_start_ms` 及保持输入顺序的 `depends_on`。候选时间所在窗口有余位时执行时间为候选时间本身，
+  被顺延则执行时间为下一窗口起点；相同输入始终产生相同结果。
 
 ## 验证
 

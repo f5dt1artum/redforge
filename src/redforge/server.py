@@ -20,6 +20,7 @@ CREDENTIALS_PATH = "/v1/credentials/analyze"
 PAYLOADS_PATH = "/v1/payloads/generate"
 ESCALATION_PATHS_PATH = "/v1/sessions/escalation-paths"
 RATE_LIMIT_PATH = "/v1/requests/rate-limit-analyze"
+SCHEDULE_PATH = "/v1/requests/schedule"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -32,6 +33,7 @@ POST_PATHS = (
     PAYLOADS_PATH,
     ESCALATION_PATHS_PATH,
     RATE_LIMIT_PATH,
+    SCHEDULE_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -109,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == RATE_LIMIT_PATH:
             self._handle_json_post(self.service.analyze_rate_limit)
+            return
+        if self.path == SCHEDULE_PATH:
+            self._handle_json_post(self.service.schedule_requests)
             return
         self.not_found()
 
