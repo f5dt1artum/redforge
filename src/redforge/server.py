@@ -16,6 +16,7 @@ CONSOLIDATE_PATH = "/v1/findings/consolidate"
 RETEST_PATH = "/v1/findings/retest"
 PLAN_PATH = "/v1/attack-chains/plan"
 EXPORT_PATH = "/v1/reports/export"
+CREDENTIALS_PATH = "/v1/credentials/analyze"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -24,6 +25,7 @@ POST_PATHS = (
     RETEST_PATH,
     PLAN_PATH,
     EXPORT_PATH,
+    CREDENTIALS_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -89,6 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == EXPORT_PATH:
             self._handle_json_post(self.service.export_report)
+            return
+        if self.path == CREDENTIALS_PATH:
+            self._handle_json_post(self.service.analyze_credentials)
             return
         self.not_found()
 
