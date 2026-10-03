@@ -156,6 +156,23 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `scheduled_ms` 升序排列，并列保持输入顺序；每项仅含 `id`、规范化 `target`、`route`、`scheduled_ms`、
   `window_start_ms` 及保持输入顺序的 `depends_on`。候选时间所在窗口有余位时执行时间为候选时间本身，
   被顺延则执行时间为下一窗口起点；相同输入始终产生相同结果。
+- `POST /v1/exercises/safety-evaluate`：演练安全阀，在动作执行前做纯本地判定，不联网、不执行动作、
+  不持久化。请求体仅含 `allow`、`deny`、`policy`、`actions`；`actions` 可为空数组。`policy` 仅含布尔
+  `enabled`、正的非布尔整数 `window_ms` 与 `max_actions_per_target`、无重复动作种类数组
+  `blocked_kinds`（元素仅可取 `discovery`、`verification`、`exploitation`、`credential`、
+  `privilege`）。每个 action 仅含该请求内唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、
+  `kind`（取值同 `blocked_kinds`）和非负非布尔整数 `scheduled_ms`，不接受多余字段。先完成全部结构
+  校验（字段缺失或多余、类型或数值非法、重复 `id`、`blocked_kinds` 重复及非法范围规则均返回 400
+  `invalid_request`），再按既有 allow/deny 语义检查每个规范化 `target`，任一越界则整体返回 403
+  `scope_violation`，不返回局部决策；空 `actions` 仍校验 policy 与范围规则。通过后按输入顺序处理：
+  `enabled` 为 `false` 时全部动作以 `emergency_stop` 阻断；否则命中 `blocked_kinds` 的动作以
+  `blocked_kind` 阻断（前两类阻断均不占配额）。其余动作按规范化 target 计入固定窗口，窗口起点为
+  `floor(scheduled_ms / window_ms) * window_ms`，每目标每窗口仅放行前 `max_actions_per_target` 个，
+  之后以 `action_limit` 阻断。成功响应仅含 `decisions` 与 `summary`：decisions 与 actions 同序，每项
+  仅含 `id`、规范化 `target`、`kind`、`scheduled_ms`、`status`、`reason`；`status` 为 `allowed` 时
+  `reason` 为 `null`，为 `blocked` 时 `reason` 只能为 `emergency_stop`、`blocked_kind`、
+  `action_limit` 三者之一。summary 仅含相互一致的 `total`、`allowed`、`blocked` 计数；空 `actions`
+  返回空 decisions 与全零 summary；相同输入始终产生相同结果。
 
 ## 验证
 

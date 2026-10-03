@@ -21,6 +21,7 @@ PAYLOADS_PATH = "/v1/payloads/generate"
 ESCALATION_PATHS_PATH = "/v1/sessions/escalation-paths"
 RATE_LIMIT_PATH = "/v1/requests/rate-limit-analyze"
 SCHEDULE_PATH = "/v1/requests/schedule"
+SAFETY_PATH = "/v1/exercises/safety-evaluate"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -34,6 +35,7 @@ POST_PATHS = (
     ESCALATION_PATHS_PATH,
     RATE_LIMIT_PATH,
     SCHEDULE_PATH,
+    SAFETY_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -114,6 +116,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == SCHEDULE_PATH:
             self._handle_json_post(self.service.schedule_requests)
+            return
+        if self.path == SAFETY_PATH:
+            self._handle_json_post(self.service.evaluate_safety)
             return
         self.not_found()
 
