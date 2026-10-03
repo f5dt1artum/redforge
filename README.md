@@ -196,6 +196,22 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `reason`，`reason` 唯一取 `sequence_mismatch`、`previous_hash_mismatch`、`hash_mismatch`、
   `head_hash_mismatch`，其中 `head_hash_mismatch` 的 `index` 等于 records 长度（空链为 0）。结构问题
   始终返回 400，链内容不一致返回 200 且 `valid` 为 `false`；相同输入始终产生相同结果。
+- `POST /v1/web/security-analyze`：离线分析 Web 响应观测中的安全配置缺陷，不联网、不持久化。请求体仅含
+  `allow`、`deny`、`checks`、`observations`；`checks` 为 `cors`、`cookie` 的非空无重复数组，
+  `observations` 可为空数组，每项仅含唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、
+  `scheme`（仅 `http` 或 `https`）和 `headers`（头名到非空字符串数组的对象，头名不区分大小写），
+  不接受多余字段。先完成全部结构校验（字段缺失或多余、类型或值非法、重复 `id` 或 `check`、非法范围规则
+  均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个观测的规范化 `target`，任一越界则
+  整体返回 403 `scope_violation`，不返回局部结果。仅分析 `checks` 指定类别：`cors` 在
+  `Access-Control-Allow-Origin` 含 `*` 且 `Access-Control-Allow-Credentials` 含忽略大小写的
+  `true` 时产生 `cors_wildcard_credentials`（severity 为 `high`）；`cookie` 逐个检查
+  `Set-Cookie`，https 响应缺少 `Secure` 产生 `cookie_missing_secure`，缺少 `HttpOnly` 产生
+  `cookie_missing_httponly`（severity 均为 `medium`，属性名不区分大小写），同一 Cookie 缺两项时产生
+  两个 finding，http 响应不检查 `Secure` 但仍检查 `HttpOnly`。成功响应仅含 `findings`，按
+  observations、checks 顺序排列，cookie 类再按 Set-Cookie 值及 Secure、HttpOnly 顺序；每项仅含
+  `observation_id`、规范化 `target`、`category`、`severity`、`cookie_name`（cors 为 `null`，
+  cookie 类取首个等号前原文，不回显完整 Cookie）。空 `observations` 或无命中返回空 `findings`；
+  相同输入始终产生相同结果。
 
 ## 验证
 

@@ -110,6 +110,10 @@ _AUDIT_RECORD_FIELDS = frozenset(
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _ZERO_HASH = "0" * 64
 
+WEB_SECURITY_CHECKS = ("cors", "cookie")
+_WEB_SECURITY_SCHEMES = ("http", "https")
+_WEB_SECURITY_OBSERVATION_FIELDS = frozenset({"id", "target", "scheme", "headers"})
+
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
 SAFETY_KINDS = ("discovery", "verification", "exploitation", "credential", "privilege")
@@ -1276,6 +1280,61 @@ def _parse_audit_event(raw: object, index: int) -> _AuditEvent:
     if not _is_int(occurred_ms) or occurred_ms < 0:
         raise ValueError(f"{what}.occurred_ms must be a non-negative integer")
     return _AuditEvent(event_id, target, kind, outcome, occurred_ms)
+
+
+@dataclass(frozen=True)
+class _WebSecurityObservation:
+    """A validated offline HTTP response observation.
+
+    target is the parsed scope entry (never a wildcard); its text attribute
+    is the normalized form reported back in findings. headers preserves the
+    input mapping and order; header names are matched case-insensitively.
+    """
+
+    id: str
+    target: _Entry
+    scheme: str
+    headers: dict[str, tuple[str, ...]]
+
+
+def _parse_web_security_observation(
+    raw: object, index: int
+) -> _WebSecurityObservation:
+    what = f"observations[{index}]"
+    obj = _require_fields(raw, _WEB_SECURITY_OBSERVATION_FIELDS, what)
+    observation_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    scheme = obj["scheme"]
+    if scheme not in _WEB_SECURITY_SCHEMES:
+        raise ValueError(f"{what}.scheme must be one of {_WEB_SECURITY_SCHEMES}")
+    raw_headers = obj["headers"]
+    if not isinstance(raw_headers, dict):
+        raise ValueError(f"{what}.headers must be an object")
+    headers: dict[str, tuple[str, ...]] = {}
+    for name, values in raw_headers.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{what}.headers header names must be non-empty strings")
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"{what}.headers[{name!r}] must be a non-empty array"
+            )
+        for item in values:
+            if not isinstance(item, str) or not item:
+                raise ValueError(
+                    f"{what}.headers[{name!r}] must contain only non-empty strings"
+                )
+        headers[name] = tuple(values)
+    return _WebSecurityObservation(observation_id, target, scheme, headers)
+
+
+def _header_values(headers: dict[str, tuple[str, ...]], name: str) -> list[str]:
+    """All values for a header name, matched case-insensitively, in order."""
+    wanted = name.lower()
+    values: list[str] = []
+    for key, items in headers.items():
+        if key.lower() == wanted:
+            values.extend(items)
+    return values
 
 
 def _url_percent_encode(text: str) -> str:
@@ -3297,3 +3356,135 @@ class Service:
                 "failure": {"index": index, "reason": reason},
             }
         }
+
+    def analyze_web_security(self, payload: object) -> dict[str, Any]:
+        """Analyze offline HTTP response observations for web weaknesses.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (including duplicate observation ids and
+        duplicate checks); only then are observation targets checked against
+        the allow/deny scope. Raises ValueError on malformed input and
+        ScopeViolationError when any target is out of scope; never returns
+        partial results. The same input always produces the same findings.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "checks", "observations"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_checks = payload["checks"]
+        if not isinstance(raw_checks, list) or not raw_checks:
+            raise ValueError("field checks must be a non-empty array")
+        checks: list[str] = []
+        seen_checks: set[str] = set()
+        for check in raw_checks:
+            if check not in WEB_SECURITY_CHECKS:
+                raise ValueError(f"checks must contain only {WEB_SECURITY_CHECKS}")
+            if check in seen_checks:
+                raise ValueError(f"checks has duplicate entry: {check!r}")
+            seen_checks.add(check)
+            checks.append(check)
+
+        raw_observations = payload["observations"]
+        if not isinstance(raw_observations, list):
+            raise ValueError("field observations must be an array")
+        observations = [
+            _parse_web_security_observation(raw, i)
+            for i, raw in enumerate(raw_observations)
+        ]
+        self._require_unique_ids(
+            (observation.id for observation in observations), "observation"
+        )
+
+        # Scope gate: every observation target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (observation.target for observation in observations),
+            allow_rules,
+            deny_rules,
+        )
+
+        findings: list[dict[str, Any]] = []
+        for observation in observations:
+            for check in checks:
+                if check == "cors":
+                    finding = self._cors_finding(observation)
+                    if finding is not None:
+                        findings.append(finding)
+                else:
+                    findings.extend(self._cookie_findings(observation))
+        return {"findings": findings}
+
+    @staticmethod
+    def _cors_finding(
+        observation: _WebSecurityObservation,
+    ) -> dict[str, Any] | None:
+        """Flag a wildcard ACAO combined with credentialed CORS."""
+        origins = _header_values(
+            observation.headers, "access-control-allow-origin"
+        )
+        credentials = _header_values(
+            observation.headers, "access-control-allow-credentials"
+        )
+        if not any("*" in value for value in origins):
+            return None
+        if not any("true" in value.lower() for value in credentials):
+            return None
+        return {
+            "observation_id": observation.id,
+            "target": observation.target.text,
+            "category": "cors_wildcard_credentials",
+            "severity": "high",
+            "cookie_name": None,
+        }
+
+    @staticmethod
+    def _cookie_findings(
+        observation: _WebSecurityObservation,
+    ) -> list[dict[str, Any]]:
+        """Check each Set-Cookie value for missing Secure/HttpOnly flags.
+
+        Attribute names are matched case-insensitively. Secure is only
+        required on https responses; HttpOnly is required on both schemes.
+        A cookie missing both yields two findings, Secure first. The cookie
+        name is the raw text before the first '='; the full cookie value is
+        never echoed back.
+        """
+        findings: list[dict[str, Any]] = []
+        for value in _header_values(observation.headers, "set-cookie"):
+            attributes = set()
+            for part in value.split(";")[1:]:
+                name = part.split("=", 1)[0].strip().lower()
+                if name:
+                    attributes.add(name)
+            cookie_name = value.split("=", 1)[0]
+            base = {
+                "observation_id": observation.id,
+                "target": observation.target.text,
+                "cookie_name": cookie_name,
+            }
+            if observation.scheme == "https" and "secure" not in attributes:
+                findings.append(
+                    {
+                        **base,
+                        "category": "cookie_missing_secure",
+                        "severity": "medium",
+                    }
+                )
+            if "httponly" not in attributes:
+                findings.append(
+                    {
+                        **base,
+                        "category": "cookie_missing_httponly",
+                        "severity": "medium",
+                    }
+                )
+        return findings
