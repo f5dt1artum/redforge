@@ -172,6 +172,30 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `scheduled_ms`、`status`、`reason`（`allowed` 时 `reason` 为 `null`，`blocked` 时只能取上述三种
   值）；summary 仅含 `total`、`allowed`、`blocked` 三个一致计数。空 `actions` 返回空 decisions 与
   全零 summary；相同输入始终产生相同结果。
+- `POST /v1/audit/build`：离线、确定性地构建演练审计链并计算完整性哈希，不联网、不执行动作、不持久化、
+  不落盘。请求体仅含 `allow`、`deny`、`exercise_id`、`events`；`exercise_id` 为非空字符串，`events`
+  可为空数组，每项仅含该链内唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、非空 `kind`、
+  非空 `outcome` 和非负非布尔整数 `occurred_ms`，不接受多余字段；按输入顺序相邻两项的 `occurred_ms`
+  不得递减。先完成全部结构校验（字段缺失或多余、类型或数值非法、重复 `id`、时间随输入顺序递减、非法
+  范围规则均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个事件的规范化 `target`，
+  任一越界则整体返回 403 `scope_violation`，不返回局部结果。成功响应仅含 `audit`：含 `exercise_id`、
+  `records`、`head_hash`。records 按输入顺序保留事件并写入规范化 `target`，再追加从 0 递增的
+  `sequence`、`previous_hash` 与 `hash`；首项 `previous_hash` 为 64 个 `0`，其余各项取前一项的
+  `hash`。`hash` 是把该记录去掉自身 `hash` 字段并加入 `exercise_id` 后，按 RFC 8785（JCS）规范化
+  得到的 UTF-8 字节计算 SHA-256 的小写十六进制。空链 `head_hash` 为全零，否则取末项 `hash`；相同
+  输入始终产生相同的记录与哈希。
+- `POST /v1/audit/verify`：离线校验一次演练审计链的结构、范围与完整性，不联网、不执行动作、不持久化、
+  不落盘。请求体仅含 `allow`、`deny` 和 `audit`（与 build 成功响应的 `audit` 同形）。先严格校验字段、
+  哈希格式（`previous_hash`、`hash`、`head_hash` 均须为 64 位小写十六进制）、事件 `id` 唯一性与
+  `occurred_ms` 的非递减顺序：任何结构问题返回 400 `invalid_request`；再对全部规范化 `target` 执行
+  既有 allow/deny 范围门禁，任一越界则整体返回 403 `scope_violation`，不返回校验结果。随后依次核验
+  每项的 `sequence`（须等于其下标）、`previous_hash`（首项为全零，其余等于前项 `hash`）、`hash`
+  （按 build 相同方式重算）以及整体 `head_hash`。成功响应仅含 `verification`：`valid` 表示整体结果，
+  `checked` 为连续通过的记录数，`head_hash` 为最后通过记录的 `hash`（无通过记录时为全零值）。全部
+  通过时 `failure` 为 `null`；遇到首个不一致即停止，`valid` 为 `false` 且 `failure` 仅含 `index` 与
+  `reason`，`reason` 唯一取 `sequence_mismatch`、`previous_hash_mismatch`、`hash_mismatch`、
+  `head_hash_mismatch`，其中 `head_hash_mismatch` 的 `index` 等于 records 长度（空链为 0）。结构问题
+  始终返回 400，链内容不一致返回 200 且 `valid` 为 `false`；相同输入始终产生相同结果。
 
 ## 验证
 

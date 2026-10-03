@@ -8,8 +8,10 @@ surface here backward compatible.
 from __future__ import annotations
 
 import base64
+import hashlib
 import heapq
 import ipaddress
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -91,6 +93,22 @@ _SAFETY_POLICY_FIELDS = frozenset(
     {"enabled", "window_ms", "max_actions_per_target", "blocked_kinds"}
 )
 _SAFETY_ACTION_FIELDS = frozenset({"id", "target", "kind", "scheduled_ms"})
+_AUDIT_EVENT_FIELDS = frozenset({"id", "target", "kind", "outcome", "occurred_ms"})
+_AUDIT_FIELDS = frozenset({"exercise_id", "records", "head_hash"})
+_AUDIT_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "target",
+        "kind",
+        "outcome",
+        "occurred_ms",
+        "sequence",
+        "previous_hash",
+        "hash",
+    }
+)
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_ZERO_HASH = "0" * 64
 
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
@@ -1232,6 +1250,34 @@ def _parse_safety_action(raw: object, index: int) -> _SafetyAction:
     return _SafetyAction(action_id, target, kind, scheduled_ms)
 
 
+@dataclass(frozen=True)
+class _AuditEvent:
+    """A validated exercise event for the deterministic audit chain.
+
+    target is the parsed scope entry (never a wildcard); its text attribute
+    is the normalized form embedded in audit records.
+    """
+
+    id: str
+    target: _Entry
+    kind: str
+    outcome: str
+    occurred_ms: int
+
+
+def _parse_audit_event(raw: object, index: int) -> _AuditEvent:
+    what = f"events[{index}]"
+    obj = _require_fields(raw, _AUDIT_EVENT_FIELDS, what)
+    event_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    kind = _non_empty_str(obj["kind"], f"{what}.kind")
+    outcome = _non_empty_str(obj["outcome"], f"{what}.outcome")
+    occurred_ms = obj["occurred_ms"]
+    if not _is_int(occurred_ms) or occurred_ms < 0:
+        raise ValueError(f"{what}.occurred_ms must be a non-negative integer")
+    return _AuditEvent(event_id, target, kind, outcome, occurred_ms)
+
+
 def _url_percent_encode(text: str) -> str:
     """Percent-encode UTF-8 bytes, keeping the RFC 3986 unreserved set."""
     pieces: list[str] = []
@@ -1256,6 +1302,131 @@ _PAYLOAD_TRANSFORMS = {
     "base64": _base64_encode,
     "hex": _hex_encode,
 }
+
+
+def _jcs_number(value: float) -> str:
+    """Serialize a float the way ECMAScript's Number::toString does (JCS).
+
+    RFC 8785 §3.2.2.3 adopts the ES2018 algorithm (with the Note 2
+    enhancement): the shortest round-trippable decimal, fixed notation for
+    -6 <= exponent <= 20, scientific otherwise (the exponent sign is kept,
+    e.g. 1e+21), and -0 rendered as 0.
+    """
+    if isinstance(value, int):
+        value = float(value)
+    if value == 0:
+        return "0"
+    text = repr(value)
+    mantissa, _, exponent = text.partition("e")
+    if exponent:
+        exp = int(exponent)
+        text = mantissa
+    else:
+        exp = 0
+    negative = text.startswith("-")
+    if negative:
+        text = text[1:]
+    int_part, _, frac_part = text.partition(".")
+    # repr() tags an integral float with ".0"; those zeros are formatting,
+    # not significant digits of the shortest round-trip representation.
+    frac_part = frac_part.rstrip("0")
+    digits = (int_part + frac_part).lstrip("0")
+    int_digits = int_part.lstrip("0")
+    if int_digits:
+        # Exponent of the most significant digit in the integer part.
+        n = len(int_digits) - 1 + exp
+    else:
+        # First significant digit sits after the point; count leading zeros.
+        leading_zeros = len(frac_part) - len(frac_part.lstrip("0"))
+        n = -leading_zeros - 1 + exp
+    decimal_at = n + 1  # number of significant digits before the point
+
+    if -6 <= n <= 20:
+        if decimal_at <= 0:
+            result = "0." + "0" * (-decimal_at) + digits
+        elif decimal_at >= len(digits):
+            result = digits + "0" * (decimal_at - len(digits))
+        else:
+            result = digits[:decimal_at] + "." + digits[decimal_at:]
+    else:
+        head = digits[0]
+        rest = digits[1:]
+        coefficient = head + ("." + rest if rest else "")
+        result = f"{coefficient}e{n:+d}"
+    return "-" + result if negative else result
+
+
+def _jcs_escape(text: str) -> str:
+    """Escape a JSON string per JCS: minimal escapes, lowercase hex."""
+    pieces = ['"']
+    for char in text:
+        codepoint = ord(char)
+        if char == '"':
+            pieces.append('\\"')
+        elif char == "\\":
+            pieces.append("\\\\")
+        elif codepoint == 0x08:
+            pieces.append("\\b")
+        elif codepoint == 0x0C:
+            pieces.append("\\f")
+        elif codepoint == 0x0A:
+            pieces.append("\\n")
+        elif codepoint == 0x0D:
+            pieces.append("\\r")
+        elif codepoint == 0x09:
+            pieces.append("\\t")
+        elif codepoint < 0x20:
+            pieces.append(f"\\u{codepoint:04x}")
+        else:
+            pieces.append(char)
+    pieces.append('"')
+    return "".join(pieces)
+
+
+def _jcs_sort_key(name: str) -> tuple:
+    """UTF-16 code-unit ordering for object member names (JCS §3.2.3)."""
+    encoded = name.encode("utf-16-be")
+    return tuple(encoded[i] << 8 | encoded[i + 1] for i in range(0, len(encoded), 2))
+
+
+def _jcs_serialize(value: object) -> str:
+    """Serialize a JSON-compatible Python value per RFC 8785."""
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return _jcs_escape(value)
+    if isinstance(value, int):
+        return _jcs_number(float(value))
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError("NaN and Infinity are not representable in JSON")
+        return _jcs_number(value)
+    if isinstance(value, dict):
+        members = []
+        for key in sorted(value, key=_jcs_sort_key):
+            if not isinstance(key, str):
+                raise ValueError("object keys must be strings")
+            members.append(_jcs_escape(key) + ":" + _jcs_serialize(value[key]))
+        return "{" + ",".join(members) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_jcs_serialize(item) for item in value) + "]"
+    raise ValueError(f"value is not JSON-compatible: {type(value).__name__}")
+
+
+def _jcs_bytes(value: object) -> bytes:
+    """RFC 8785 canonical bytes (UTF-8) for a JSON-compatible value."""
+    return _jcs_serialize(value).encode("utf-8")
+
+
+def _audit_record_hash(record: dict[str, Any], exercise_id: str) -> str:
+    """SHA-256 over the RFC 8785 bytes of record-minus-hash plus exercise_id."""
+    payload = {key: value for key, value in record.items() if key != "hash"}
+    payload["exercise_id"] = exercise_id
+    return hashlib.sha256(_jcs_bytes(payload)).hexdigest()
 
 
 class Service:
@@ -2922,4 +3093,207 @@ class Service:
                 "allowed": allowed_count,
                 "blocked": len(actions) - allowed_count,
             },
+        }
+
+    def build_audit(self, payload: object) -> dict[str, Any]:
+        """Build a deterministic, offline exercise audit chain.
+
+        Pure, local evaluation: no network access, no action execution, no
+        persistent state. All structure is validated first (including
+        duplicate event ids and non-increasing timestamps); only then are
+        event targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns a partial chain. The same input always
+        produces the same records and hashes.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "exercise_id", "events"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        exercise_id = _non_empty_str(payload["exercise_id"], "exercise_id")
+
+        raw_events = payload["events"]
+        if not isinstance(raw_events, list):
+            raise ValueError("field events must be an array")
+        events = [_parse_audit_event(raw, i) for i, raw in enumerate(raw_events)]
+        self._require_unique_ids((event.id for event in events), "event")
+        for index in range(1, len(events)):
+            if events[index].occurred_ms < events[index - 1].occurred_ms:
+                raise ValueError(
+                    f"events[{index}].occurred_ms decreases relative to input "
+                    "order"
+                )
+
+        # Scope gate: every event target must be authorized before any record
+        # is hashed; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (event.target for event in events), allow_rules, deny_rules
+        )
+
+        records: list[dict[str, Any]] = []
+        previous_hash = _ZERO_HASH
+        for sequence, event in enumerate(events):
+            record = {
+                "id": event.id,
+                "target": event.target.text,
+                "kind": event.kind,
+                "outcome": event.outcome,
+                "occurred_ms": event.occurred_ms,
+                "sequence": sequence,
+                "previous_hash": previous_hash,
+            }
+            record["hash"] = _audit_record_hash(record, exercise_id)
+            records.append(record)
+            previous_hash = record["hash"]
+        head_hash = previous_hash if records else _ZERO_HASH
+        return {
+            "audit": {
+                "exercise_id": exercise_id,
+                "records": records,
+                "head_hash": head_hash,
+            }
+        }
+
+    def verify_audit(self, payload: object) -> dict[str, Any]:
+        """Verify a deterministic exercise audit chain end to end.
+
+        Pure, local evaluation: no network access, no action execution, no
+        persistent state. Structure, hash formats, event-id uniqueness and
+        timestamp ordering are validated strictly first (any failure is a
+        ValueError); every normalized target then passes the allow/deny
+        scope gate (an out-of-scope target is a ScopeViolationError). Only
+        afterwards are sequence/previous_hash/hash/head_hash checked, and the
+        first inconsistency is reported rather than raised.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "audit"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        audit = _require_fields(payload["audit"], _AUDIT_FIELDS, "audit")
+        exercise_id = _non_empty_str(audit["exercise_id"], "audit.exercise_id")
+        head_hash = audit["head_hash"]
+        if not isinstance(head_hash, str) or not _HEX64_RE.fullmatch(head_hash):
+            raise ValueError("audit.head_hash must be a 64-character lowercase hex string")
+
+        raw_records = audit["records"]
+        if not isinstance(raw_records, list):
+            raise ValueError("audit.records must be an array")
+        records = [
+            self._parse_audit_record(raw, i)
+            for i, raw in enumerate(raw_records)
+        ]
+        self._require_unique_ids(
+            (record["id"] for record in records), "event"
+        )
+        for index in range(1, len(records)):
+            if records[index]["occurred_ms"] < records[index - 1]["occurred_ms"]:
+                raise ValueError(
+                    f"audit.records[{index}].occurred_ms decreases relative to "
+                    "input order"
+                )
+
+        # Scope gate over the normalized targets carried by the chain.
+        targets = [
+            _parse_entry(record["target"], allow_wildcard=False)
+            for record in records
+        ]
+        self._assert_targets_in_scope(targets, allow_rules, deny_rules)
+
+        checked = 0
+        last_hash = _ZERO_HASH
+        expected_previous = _ZERO_HASH
+        for index, record in enumerate(records):
+            if record["sequence"] != index:
+                return self._verification_failure(
+                    checked, last_hash, index, "sequence_mismatch"
+                )
+            if record["previous_hash"] != expected_previous:
+                return self._verification_failure(
+                    checked, last_hash, index, "previous_hash_mismatch"
+                )
+            if _audit_record_hash(record, exercise_id) != record["hash"]:
+                return self._verification_failure(
+                    checked, last_hash, index, "hash_mismatch"
+                )
+            checked += 1
+            last_hash = record["hash"]
+            expected_previous = record["hash"]
+        expected_head = last_hash if records else _ZERO_HASH
+        if head_hash != expected_head:
+            return self._verification_failure(
+                checked, last_hash, len(records), "head_hash_mismatch"
+            )
+        return {
+            "verification": {
+                "valid": True,
+                "checked": checked,
+                "head_hash": last_hash if records else _ZERO_HASH,
+                "failure": None,
+            }
+        }
+
+    @staticmethod
+    def _parse_audit_record(raw: object, index: int) -> dict[str, Any]:
+        what = f"audit.records[{index}]"
+        obj = _require_fields(raw, _AUDIT_RECORD_FIELDS, what)
+        event_id = _non_empty_str(obj["id"], f"{what}.id")
+        target = _parse_entry(obj["target"], allow_wildcard=False)
+        kind = _non_empty_str(obj["kind"], f"{what}.kind")
+        outcome = _non_empty_str(obj["outcome"], f"{what}.outcome")
+        occurred_ms = obj["occurred_ms"]
+        if not _is_int(occurred_ms) or occurred_ms < 0:
+            raise ValueError(f"{what}.occurred_ms must be a non-negative integer")
+        sequence = obj["sequence"]
+        if not _is_int(sequence) or sequence < 0:
+            raise ValueError(f"{what}.sequence must be a non-negative integer")
+        previous_hash = obj["previous_hash"]
+        if not isinstance(previous_hash, str) or not _HEX64_RE.fullmatch(
+            previous_hash
+        ):
+            raise ValueError(
+                f"{what}.previous_hash must be a 64-character lowercase hex string"
+            )
+        record_hash = obj["hash"]
+        if not isinstance(record_hash, str) or not _HEX64_RE.fullmatch(record_hash):
+            raise ValueError(
+                f"{what}.hash must be a 64-character lowercase hex string"
+            )
+        return {
+            "id": event_id,
+            "target": target.text,
+            "kind": kind,
+            "outcome": outcome,
+            "occurred_ms": occurred_ms,
+            "sequence": sequence,
+            "previous_hash": previous_hash,
+            "hash": record_hash,
+        }
+
+    @staticmethod
+    def _verification_failure(
+        checked: int, last_hash: str, index: int, reason: str
+    ) -> dict[str, Any]:
+        return {
+            "verification": {
+                "valid": False,
+                "checked": checked,
+                "head_hash": last_hash,
+                "failure": {"index": index, "reason": reason},
+            }
         }

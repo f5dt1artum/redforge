@@ -22,6 +22,8 @@ ESCALATION_PATHS_PATH = "/v1/sessions/escalation-paths"
 RATE_LIMIT_PATH = "/v1/requests/rate-limit-analyze"
 SCHEDULE_PATH = "/v1/requests/schedule"
 SAFETY_EVALUATE_PATH = "/v1/exercises/safety-evaluate"
+AUDIT_BUILD_PATH = "/v1/audit/build"
+AUDIT_VERIFY_PATH = "/v1/audit/verify"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -36,6 +38,8 @@ POST_PATHS = (
     RATE_LIMIT_PATH,
     SCHEDULE_PATH,
     SAFETY_EVALUATE_PATH,
+    AUDIT_BUILD_PATH,
+    AUDIT_VERIFY_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -119,6 +123,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == SAFETY_EVALUATE_PATH:
             self._handle_json_post(self.service.safety_evaluate)
+            return
+        if self.path == AUDIT_BUILD_PATH:
+            self._handle_json_post(self.service.build_audit)
+            return
+        if self.path == AUDIT_VERIFY_PATH:
+            self._handle_json_post(self.service.verify_audit)
             return
         self.not_found()
 
