@@ -53,6 +53,20 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
   每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
   `findings` 返回空 `plans`，相同输入的数组顺序稳定。
+- `POST /v1/reports/export`：把既有结果导出为单一稳定的证据报告，纯本地处理。请求体仅含 `allow`、`deny`、
+  `title`、`findings`、`comparisons`、`plans`；`title` 为非空字符串，后三项分别沿用 consolidate、retest 和
+  attack-chains/plan 的结果项，均为可空数组。先完成结构及交叉一致性校验：以规范化 `target` 与区分大小写的
+  `template_id` 为键，各数组内不得重复；comparison 的 `status` 仅可为 `persistent`、`resolved`、`new`，
+  `before`/`after` 的空值位置须符合状态，非空项须与外层键一致；`comparisons` 非空时，非空 `after` 须与
+  `findings` 的同键项完整一致，且 `findings` 不得有未被比较的当前项；plan 的 `target` 唯一且须存在于当前
+  findings，阶段 `id` 在单个计划内唯一，`status` 与 `reason` 只能采用 `ready`/`null`、
+  `skipped`/`missing_requirements`、`skipped`/`dependency_blocked` 三种既有组合；同键出现不同 `name`
+  也属不一致。上述错误一律返回 400 `invalid_request`。结构校验通过后，对全部 `target` 执行范围评估，
+  任一越界则整体返回 403 `scope_violation`，不返回局部报告。成功响应仅含 `report`：`schema_version`
+  为字符串 `"1.0"`，`title` 原样保留；`summary` 只含 `targets`、`current_findings`、`persistent`、
+  `resolved`、`new`、`ready_stages`、`skipped_stages` 七个计数；`targets` 为分组报告，目标按 findings
+  首次出现排序、再追加仅见于 comparisons 的目标，每个目标项只含规范化 `target`、`findings`、`comparisons`、
+  `stages`。计数从实际内容计算，空输入返回全零 summary 和空 targets，相同输入产生相同结果。
 
 ## 验证
 

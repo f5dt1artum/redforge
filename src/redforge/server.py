@@ -14,7 +14,15 @@ MATCH_PATH = "/v1/vulnerabilities/match"
 CONSOLIDATE_PATH = "/v1/findings/consolidate"
 RETEST_PATH = "/v1/findings/retest"
 PLAN_PATH = "/v1/attack-chains/plan"
-POST_PATHS = (SCOPE_PATH, MATCH_PATH, CONSOLIDATE_PATH, RETEST_PATH, PLAN_PATH)
+EXPORT_PATH = "/v1/reports/export"
+POST_PATHS = (
+    SCOPE_PATH,
+    MATCH_PATH,
+    CONSOLIDATE_PATH,
+    RETEST_PATH,
+    PLAN_PATH,
+    EXPORT_PATH,
+)
 MAX_BODY_BYTES = 1024 * 1024
 
 
@@ -73,6 +81,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == PLAN_PATH:
             self._handle_json_post(self.service.plan_attack_chains)
+            return
+        if self.path == EXPORT_PATH:
+            self._handle_json_post(self.service.export_report)
             return
         self.not_found()
 

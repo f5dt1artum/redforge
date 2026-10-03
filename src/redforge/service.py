@@ -40,6 +40,20 @@ _CONSOLIDATED_FIELDS = frozenset(
 )
 _REQUIREMENT_FIELDS = frozenset({"template_id", "min_severity", "min_confidence"})
 _STAGE_FIELDS = frozenset({"id", "name", "logic", "requires", "depends_on"})
+_COMPARISON_FIELDS = frozenset(
+    {"target", "template_id", "name", "status", "before", "after"}
+)
+_PLAN_FIELDS = frozenset({"target", "stages"})
+_STAGE_RESULT_FIELDS = frozenset({"id", "name", "status", "reason"})
+
+COMPARISON_STATUSES = ("persistent", "resolved", "new")
+_STAGE_RESULT_COMBOS = frozenset(
+    {
+        ("ready", None),
+        ("skipped", "missing_requirements"),
+        ("skipped", "dependency_blocked"),
+    }
+)
 
 _SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -379,6 +393,152 @@ def _parse_consolidated_item(raw: object, what: str) -> _ConsolidatedItem:
         tuple(evidence),
         confidence,
     )
+
+
+@dataclass(frozen=True)
+class _Comparison:
+    """A validated item shaped like a retest response comparison entry."""
+
+    target: _Entry
+    template_id: str
+    name: str
+    status: str
+    before: _ConsolidatedItem | None
+    after: _ConsolidatedItem | None
+
+
+def _parse_comparison(raw: object, what: str) -> _Comparison:
+    obj = _require_fields(raw, _COMPARISON_FIELDS, what)
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    template_id = _non_empty_str(obj["template_id"], f"{what}.template_id")
+    name = obj["name"]
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{what}.name must be a non-empty string")
+    status = obj["status"]
+    if status not in COMPARISON_STATUSES:
+        raise ValueError(f"{what}.status must be one of {COMPARISON_STATUSES}")
+    before = obj["before"]
+    after = obj["after"]
+    if status == "persistent":
+        if before is None or after is None:
+            raise ValueError(
+                f"{what} with status 'persistent' needs non-null before and after"
+            )
+    elif status == "resolved":
+        if before is None or after is not None:
+            raise ValueError(
+                f"{what} with status 'resolved' needs before and null after"
+            )
+    elif before is not None or after is None:
+        raise ValueError(
+            f"{what} with status 'new' needs null before and non-null after"
+        )
+    parsed_before = (
+        None
+        if before is None
+        else _parse_consolidated_item(before, f"{what}.before")
+    )
+    parsed_after = (
+        None if after is None else _parse_consolidated_item(after, f"{what}.after")
+    )
+    key = (target.text, template_id)
+    for side, item in (("before", parsed_before), ("after", parsed_after)):
+        if item is not None and (item.target.text, item.template_id) != key:
+            raise ValueError(
+                f"{what}.{side} key does not match the comparison key"
+            )
+    return _Comparison(target, template_id, name, status, parsed_before, parsed_after)
+
+
+@dataclass(frozen=True)
+class _StageResult:
+    """A validated item shaped like a plan response stage entry."""
+
+    id: str
+    name: str
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """A validated item shaped like a plan response entry."""
+
+    target: _Entry
+    stages: tuple[_StageResult, ...]
+
+
+def _parse_stage_result(raw: object, what: str) -> _StageResult:
+    obj = _require_fields(raw, _STAGE_RESULT_FIELDS, what)
+    stage_id = _non_empty_str(obj["id"], f"{what}.id")
+    name = _non_empty_str(obj["name"], f"{what}.name")
+    status = obj["status"]
+    reason = obj["reason"]
+    if not isinstance(status, str) or (status, reason) not in _STAGE_RESULT_COMBOS:
+        raise ValueError(
+            f"{what} has an unknown status/reason combination: "
+            f"{status!r}/{reason!r}"
+        )
+    return _StageResult(stage_id, name, status, reason)
+
+
+def _parse_plan(raw: object, index: int) -> _Plan:
+    what = f"plans[{index}]"
+    obj = _require_fields(raw, _PLAN_FIELDS, what)
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    stages = obj["stages"]
+    if not isinstance(stages, list):
+        raise ValueError(f"{what}.stages must be an array")
+    seen_ids: set[str] = set()
+    parsed: list[_StageResult] = []
+    for i, raw_stage in enumerate(stages):
+        stage = _parse_stage_result(raw_stage, f"{what}.stages[{i}]")
+        if stage.id in seen_ids:
+            raise ValueError(f"{what} has duplicate stage id: {stage.id!r}")
+        seen_ids.add(stage.id)
+        parsed.append(stage)
+    return _Plan(target, tuple(parsed))
+
+
+def _consolidated_dict(item: _ConsolidatedItem) -> dict[str, Any]:
+    return {
+        "target": item.target.text,
+        "template_id": item.template_id,
+        "name": item.name,
+        "severity": item.severity,
+        "observation_ids": list(item.observation_ids),
+        "sources": list(item.sources),
+        "evidence": list(item.evidence),
+        "confidence": item.confidence,
+    }
+
+
+def _comparison_dict(comparison: _Comparison) -> dict[str, Any]:
+    return {
+        "target": comparison.target.text,
+        "template_id": comparison.template_id,
+        "name": comparison.name,
+        "status": comparison.status,
+        "before": (
+            None
+            if comparison.before is None
+            else _consolidated_dict(comparison.before)
+        ),
+        "after": (
+            None
+            if comparison.after is None
+            else _consolidated_dict(comparison.after)
+        ),
+    }
+
+
+def _stage_result_dict(stage: _StageResult) -> dict[str, Any]:
+    return {
+        "id": stage.id,
+        "name": stage.name,
+        "status": stage.status,
+        "reason": stage.reason,
+    }
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1236,227 @@ class Service:
                 }
             )
         return results
+
+    def export_report(self, payload: object) -> dict[str, Any]:
+        """Export existing results as one stable, local evidence report.
+
+        Pure, local evaluation: no network access, no persistent state. The
+        findings, comparisons, and plans carry the same shapes as the
+        consolidate, retest, and attack-chains/plan response items. All
+        structure and cross-consistency is validated first (any violation
+        raises ValueError), then every target passes the scope gate (any
+        rejection raises ScopeViolationError); never returns a partial
+        report. The same input always produces the same report.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "title", "findings", "comparisons", "plans"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        title = payload["title"]
+        if not isinstance(title, str) or not title:
+            raise ValueError("field title must be a non-empty string")
+
+        raw_findings = payload["findings"]
+        if not isinstance(raw_findings, list):
+            raise ValueError("field findings must be an array")
+        findings = [
+            _parse_consolidated_item(raw, f"findings[{i}]")
+            for i, raw in enumerate(raw_findings)
+        ]
+
+        raw_comparisons = payload["comparisons"]
+        if not isinstance(raw_comparisons, list):
+            raise ValueError("field comparisons must be an array")
+        comparisons = [
+            _parse_comparison(raw, f"comparisons[{i}]")
+            for i, raw in enumerate(raw_comparisons)
+        ]
+
+        raw_plans = payload["plans"]
+        if not isinstance(raw_plans, list):
+            raise ValueError("field plans must be an array")
+        plans = [_parse_plan(raw, i) for i, raw in enumerate(raw_plans)]
+
+        # Structural and cross-consistency validation must finish before the
+        # scope gate, so an inconsistent report is a 400 even when a target
+        # is out of scope.
+        self._check_report_consistency(findings, comparisons, plans)
+
+        # Then gate every target; a single rejection voids the whole report.
+        self._assert_targets_in_scope(
+            (item.target for item in findings), allow_rules, deny_rules
+        )
+        self._assert_targets_in_scope(
+            (item.target for item in comparisons), allow_rules, deny_rules
+        )
+        self._assert_targets_in_scope(
+            (plan.target for plan in plans), allow_rules, deny_rules
+        )
+
+        return {"report": self._build_report(title, findings, comparisons, plans)}
+
+    @staticmethod
+    def _check_report_consistency(
+        findings: list[_ConsolidatedItem],
+        comparisons: list[_Comparison],
+        plans: list[_Plan],
+    ) -> None:
+        """Cross-validate keys and names across the three result arrays."""
+        names: dict[tuple[str, str], str] = {}
+
+        def register_name(key: tuple[str, str], name: str) -> None:
+            known = names.get(key)
+            if known is None:
+                names[key] = name
+            elif known != name:
+                raise ValueError(
+                    f"conflicting names for ({key[0]!r}, {key[1]!r}): "
+                    f"{known!r} vs {name!r}"
+                )
+
+        finding_by_key: dict[tuple[str, str], _ConsolidatedItem] = {}
+        for item in findings:
+            key = (item.target.text, item.template_id)
+            if key in finding_by_key:
+                raise ValueError(
+                    f"duplicate finding key: ({key[0]!r}, {key[1]!r})"
+                )
+            finding_by_key[key] = item
+            register_name(key, item.name)
+
+        comparison_keys: set[tuple[str, str]] = set()
+        after_keys: set[tuple[str, str]] = set()
+        for comparison in comparisons:
+            key = (comparison.target.text, comparison.template_id)
+            if key in comparison_keys:
+                raise ValueError(
+                    f"duplicate comparison key: ({key[0]!r}, {key[1]!r})"
+                )
+            comparison_keys.add(key)
+            register_name(key, comparison.name)
+            if comparison.before is not None:
+                register_name(key, comparison.before.name)
+            if comparison.after is not None:
+                after_keys.add(key)
+                register_name(key, comparison.after.name)
+
+        if comparisons:
+            # A non-null after must be the exact current finding for its
+            # key, and every current finding must be compared.
+            for comparison in comparisons:
+                if comparison.after is None:
+                    continue
+                key = (comparison.target.text, comparison.template_id)
+                current = finding_by_key.get(key)
+                if current is None or current != comparison.after:
+                    raise ValueError(
+                        "comparison after does not match the current finding "
+                        f"for key ({key[0]!r}, {key[1]!r})"
+                    )
+            for key in finding_by_key:
+                if key not in after_keys:
+                    raise ValueError(
+                        "current finding not covered by comparisons: "
+                        f"({key[0]!r}, {key[1]!r})"
+                    )
+
+        finding_targets = {item.target.text for item in findings}
+        plan_targets: set[str] = set()
+        for plan in plans:
+            target = plan.target.text
+            if target in plan_targets:
+                raise ValueError(f"duplicate plan target: {target!r}")
+            plan_targets.add(target)
+            if target not in finding_targets:
+                raise ValueError(
+                    f"plan target has no current findings: {target!r}"
+                )
+
+    @staticmethod
+    def _build_report(
+        title: str,
+        findings: list[_ConsolidatedItem],
+        comparisons: list[_Comparison],
+        plans: list[_Plan],
+    ) -> dict[str, Any]:
+        """Group validated results per normalized target and count them."""
+        order: list[str] = []
+        findings_by_target: dict[str, list[_ConsolidatedItem]] = {}
+        for item in findings:
+            target = item.target.text
+            if target not in findings_by_target:
+                findings_by_target[target] = []
+                order.append(target)
+            findings_by_target[target].append(item)
+        comparisons_by_target: dict[str, list[_Comparison]] = {}
+        for comparison in comparisons:
+            target = comparison.target.text
+            if target not in comparisons_by_target:
+                comparisons_by_target[target] = []
+                if target not in findings_by_target:
+                    order.append(target)
+            comparisons_by_target[target].append(comparison)
+        plans_by_target = {plan.target.text: plan for plan in plans}
+
+        targets = []
+        for target in order:
+            plan = plans_by_target.get(target)
+            targets.append(
+                {
+                    "target": target,
+                    "findings": [
+                        _consolidated_dict(item)
+                        for item in findings_by_target.get(target, [])
+                    ],
+                    "comparisons": [
+                        _comparison_dict(comparison)
+                        for comparison in comparisons_by_target.get(target, [])
+                    ],
+                    "stages": [
+                        _stage_result_dict(stage)
+                        for stage in (plan.stages if plan is not None else ())
+                    ],
+                }
+            )
+
+        summary = {
+            "targets": len(targets),
+            "current_findings": len(findings),
+            "persistent": sum(
+                1 for item in comparisons if item.status == "persistent"
+            ),
+            "resolved": sum(
+                1 for item in comparisons if item.status == "resolved"
+            ),
+            "new": sum(1 for item in comparisons if item.status == "new"),
+            "ready_stages": sum(
+                1
+                for plan in plans
+                for stage in plan.stages
+                if stage.status == "ready"
+            ),
+            "skipped_stages": sum(
+                1
+                for plan in plans
+                for stage in plan.stages
+                if stage.status == "skipped"
+            ),
+        }
+        return {
+            "schema_version": "1.0",
+            "title": title,
+            "summary": summary,
+            "targets": targets,
+        }
 
     @staticmethod
     def _require_unique_ids(ids: Any, what: str) -> None:
