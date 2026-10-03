@@ -40,6 +40,15 @@ _CONSOLIDATED_FIELDS = frozenset(
 )
 _REQUIREMENT_FIELDS = frozenset({"template_id", "min_severity", "min_confidence"})
 _STAGE_FIELDS = frozenset({"id", "name", "logic", "requires", "depends_on"})
+_COMPARISON_FIELDS = frozenset(
+    {"target", "template_id", "name", "status", "before", "after"}
+)
+_PLAN_FIELDS = frozenset({"target", "stages"})
+_PLAN_STAGE_FIELDS = frozenset({"id", "name", "status", "reason"})
+
+_COMPARISON_STATUSES = ("persistent", "resolved", "new")
+_PLAN_STAGE_REASONS = ("missing_requirements", "dependency_blocked")
+REPORT_SCHEMA_VERSION = "1.0"
 
 _SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -448,6 +457,122 @@ def _parse_stage(raw: object, index: int, seen_ids: set[str]) -> _Stage:
         seen_deps.add(dep)
         deps.append(dep)
     return _Stage(stage_id, name, logic, parsed_requires, tuple(deps))
+
+
+def _parse_comparison(raw: object, index: int) -> dict[str, Any]:
+    """Validate one item shaped like a retest response comparison entry."""
+    what = f"comparisons[{index}]"
+    obj = _require_fields(raw, _COMPARISON_FIELDS, what)
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    template_id = _non_empty_str(obj["template_id"], f"{what}.template_id")
+    name = obj["name"]
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{what}.name must be a non-empty string")
+    status = obj["status"]
+    if status not in _COMPARISON_STATUSES:
+        raise ValueError(
+            f"{what}.status must be one of {_COMPARISON_STATUSES}"
+        )
+    before = _parse_comparison_side(obj["before"], f"{what}.before")
+    after = _parse_comparison_side(obj["after"], f"{what}.after")
+    # Null positions are fixed by the status: resolved findings have no
+    # current item, new findings have no baseline item, persistent ones
+    # carry both.
+    if status == "persistent" and (before is None or after is None):
+        raise ValueError(f"{what}: persistent comparison needs both sides")
+    if status == "resolved" and (before is None or after is not None):
+        raise ValueError(
+            f"{what}: resolved comparison needs a non-null before and null after"
+        )
+    if status == "new" and (before is not None or after is None):
+        raise ValueError(
+            f"{what}: new comparison needs null before and a non-null after"
+        )
+    for side, item in (("before", before), ("after", after)):
+        if item is not None:
+            if item["target"] != target.text:
+                raise ValueError(
+                    f"{what}.{side}.target does not match the outer target"
+                )
+            if item["template_id"] != template_id:
+                raise ValueError(
+                    f"{what}.{side}.template_id does not match the outer key"
+                )
+    return {
+        "target": target.text,
+        "template_id": template_id,
+        "name": name,
+        "status": status,
+        "before": before,
+        "after": after,
+    }
+
+
+def _canonical_consolidated(item: _ConsolidatedItem) -> dict[str, Any]:
+    """Stable dict shape shared by consolidate/retest result items."""
+    return {
+        "target": item.target.text,
+        "template_id": item.template_id,
+        "name": item.name,
+        "severity": item.severity,
+        "observation_ids": list(item.observation_ids),
+        "sources": list(item.sources),
+        "evidence": sorted(item.evidence),
+        "confidence": item.confidence,
+    }
+
+
+def _parse_comparison_side(raw: object, what: str) -> dict[str, Any] | None:
+    """Validate one before/after consolidated item, or accept null."""
+    if raw is None:
+        return None
+    return _canonical_consolidated(_parse_consolidated_item(raw, what))
+
+
+def _parse_plan(raw: object, index: int) -> dict[str, Any]:
+    """Validate one item shaped like an attack-chains plan response entry."""
+    what = f"plans[{index}]"
+    obj = _require_fields(raw, _PLAN_FIELDS, what)
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    raw_stages = obj["stages"]
+    if not isinstance(raw_stages, list):
+        raise ValueError(f"{what}.stages must be an array")
+    stages: list[dict[str, Any]] = []
+    seen_stage_ids: set[str] = set()
+    for j, raw_stage in enumerate(raw_stages):
+        stage_what = f"{what}.stages[{j}]"
+        stage_obj = _require_fields(raw_stage, _PLAN_STAGE_FIELDS, stage_what)
+        stage_id = _non_empty_str(stage_obj["id"], f"{stage_what}.id")
+        if stage_id in seen_stage_ids:
+            raise ValueError(f"{what} has duplicate stage id: {stage_id!r}")
+        seen_stage_ids.add(stage_id)
+        stage_name = _non_empty_str(stage_obj["name"], f"{stage_what}.name")
+        status = stage_obj["status"]
+        reason = stage_obj["reason"]
+        if status == "ready":
+            if reason is not None:
+                raise ValueError(
+                    f"{stage_what}: ready stage must have null reason"
+                )
+        elif status == "skipped":
+            if reason not in _PLAN_STAGE_REASONS:
+                raise ValueError(
+                    f"{stage_what}: skipped stage reason must be one of "
+                    f"{_PLAN_STAGE_REASONS}"
+                )
+        else:
+            raise ValueError(
+                f"{stage_what}.status must be one of ('ready', 'skipped')"
+            )
+        stages.append(
+            {
+                "id": stage_id,
+                "name": stage_name,
+                "status": status,
+                "reason": reason,
+            }
+        )
+    return {"target": target.text, "stages": stages}
 
 
 def _apply_operator(matcher: _Matcher, text: str) -> bool:
@@ -1008,6 +1133,188 @@ class Service:
             for target, target_findings in groups.items()
         ]
         return {"plans": plans}
+
+    def export_report(self, payload: object) -> dict[str, Any]:
+        """Export consolidated findings, retests and plans as one report.
+
+        Pure, local assembly: no network access, no persistent state. The
+        inputs carry the shapes of the consolidate (``consolidated``),
+        retest (``comparisons``) and plan (``plans``) response arrays; any
+        of the three may be null. All structure and cross-consistency is
+        validated before the scope gate, and every target then passes the
+        existing allow/deny rules. Raises ValueError on malformed or
+        inconsistent input and ScopeViolationError for any out-of-scope
+        target; never returns a partial report.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "title", "findings", "comparisons", "plans"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        title = _non_empty_str(payload["title"], "field title")
+        for key in ("findings", "comparisons", "plans"):
+            value = payload[key]
+            if value is not None and not isinstance(value, list):
+                raise ValueError(f"field {key} must be an array or null")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        findings_items = [
+            _parse_consolidated_item(raw, f"findings[{i}]")
+            for i, raw in enumerate(payload["findings"] or [])
+        ]
+        comparisons = [
+            _parse_comparison(raw, i)
+            for i, raw in enumerate(payload["comparisons"] or [])
+        ]
+        plans = [_parse_plan(raw, i) for i, raw in enumerate(payload["plans"] or [])]
+
+        # Structural and cross-consistency validation must finish before the
+        # scope gate, mirroring the other endpoints.
+        finding_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        finding_order: list[tuple[str, str]] = []
+        for item in findings_items:
+            key = (item.target.text, item.template_id)
+            if key in finding_by_key:
+                raise ValueError(
+                    f"duplicate finding key: ({key[0]!r}, {key[1]!r})"
+                )
+            finding_by_key[key] = _canonical_consolidated(item)
+            finding_order.append(key)
+
+        comparison_keys: set[tuple[str, str]] = set()
+        comparison_targets: list[str] = []
+        persistent = resolved = new = 0
+        for cmp_ in comparisons:
+            key = (cmp_["target"], cmp_["template_id"])
+            if key in comparison_keys:
+                raise ValueError(
+                    f"duplicate comparison key: ({key[0]!r}, {key[1]!r})"
+                )
+            comparison_keys.add(key)
+            comparison_targets.append(cmp_["target"])
+            if cmp_["status"] == "persistent":
+                persistent += 1
+            elif cmp_["status"] == "resolved":
+                resolved += 1
+            else:
+                new += 1
+            # The outer name is the baseline name for persistent/resolved
+            # items and the current name for new ones, exactly as retest
+            # emits it; a mismatch for the same key is inconsistent.
+            named_side = (
+                cmp_["before"] if cmp_["before"] is not None else cmp_["after"]
+            )
+            if cmp_["name"] != named_side["name"]:
+                raise ValueError(
+                    f"comparison name for ({key[0]!r}, {key[1]!r}) does not "
+                    "match its non-null side"
+                )
+
+        if comparisons:
+            # Current findings and non-null after items describe the same
+            # retest state, so the two key sets must match exactly and each
+            # after item must be byte-for-byte the consolidated finding.
+            after_by_key = {
+                (cmp_["target"], cmp_["template_id"]): cmp_["after"]
+                for cmp_ in comparisons
+                if cmp_["after"] is not None
+            }
+            if set(after_by_key) != set(finding_order):
+                raise ValueError(
+                    "comparisons after-state does not match the findings set"
+                )
+            for key, current in finding_by_key.items():
+                if after_by_key[key] != current:
+                    raise ValueError(
+                        "comparison after item differs from the finding for "
+                        f"({key[0]!r}, {key[1]!r})"
+                    )
+
+        plan_targets: set[str] = set()
+        ready_stages = skipped_stages = 0
+        finding_targets = {target for target, _ in finding_order}
+        for plan in plans:
+            if plan["target"] in plan_targets:
+                raise ValueError(f"duplicate plan target: {plan['target']!r}")
+            plan_targets.add(plan["target"])
+            if plan["target"] not in finding_targets:
+                raise ValueError(
+                    f"plan target {plan['target']!r} has no current finding"
+                )
+            for stage in plan["stages"]:
+                if stage["status"] == "ready":
+                    ready_stages += 1
+                else:
+                    skipped_stages += 1
+
+        # Then gate every target across all three inputs; a single rejection
+        # voids the whole export.
+        targets = [item.target for item in findings_items]
+        targets.extend(
+            _parse_entry(target, allow_wildcard=False)
+            for target in comparison_targets
+        )
+        targets.extend(
+            _parse_entry(target, allow_wildcard=False) for target in plan_targets
+        )
+        self._assert_targets_in_scope(targets, allow_rules, deny_rules)
+
+        # Group by normalized target: targets introduced by findings first in
+        # first-occurrence order, then targets seen only in comparisons.
+        grouped: dict[str, dict[str, Any]] = {}
+        target_order: list[str] = []
+
+        def group_for(target: str) -> dict[str, Any]:
+            group = grouped.get(target)
+            if group is None:
+                group = {
+                    "findings": [],
+                    "comparisons": [],
+                    "stages": [],
+                }
+                grouped[target] = group
+                target_order.append(target)
+            return group
+
+        for key in finding_order:
+            group_for(key[0])["findings"].append(finding_by_key[key])
+        for cmp_ in comparisons:
+            group_for(cmp_["target"])["comparisons"].append(cmp_)
+        for plan in plans:
+            group_for(plan["target"])["stages"] = plan["stages"]
+
+        targets_report = [
+            {
+                "target": target,
+                "findings": grouped[target]["findings"],
+                "comparisons": grouped[target]["comparisons"],
+                "stages": grouped[target]["stages"],
+            }
+            for target in target_order
+        ]
+        return {
+            "report": {
+                "schema_version": REPORT_SCHEMA_VERSION,
+                "title": title,
+                "summary": {
+                    "targets": len(target_order),
+                    "current_findings": len(finding_order),
+                    "persistent": persistent,
+                    "resolved": resolved,
+                    "new": new,
+                    "ready_stages": ready_stages,
+                    "skipped_stages": skipped_stages,
+                },
+                "targets": targets_report,
+            }
+        }
 
     @staticmethod
     def _resolve_stage_order(stages: list[_Stage]) -> list[_Stage]:

@@ -53,6 +53,24 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
   每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
   `findings` 返回空 `plans`，相同输入的数组顺序稳定。
+- `POST /v1/reports/export`：把既有汇总、复测比较与攻击链计划整理为单一证据报告，纯本地处理，不执行
+  阶段、不持久化。请求体仅含 `allow`、`deny`、`title`、`findings`、`comparisons`、`plans`；
+  `title` 为非空字符串并原样保留，后三者分别沿用 consolidate 的 `consolidated`、retest 的
+  `comparisons`、attack-chains/plan 的 `plans` 结果项形状，均为可空数组。先完成全部结构与交叉一致性
+  校验：规范化 `target` 与区分大小写的 `template_id` 组成键，各数组内不得重复；comparison 的 `status`
+  仅可为 `persistent`、`resolved`、`new`，`before`/`after` 的空值位置须符合状态（persistent 两侧
+  非空、resolved 仅 before 非空、new 仅 after 非空），非空侧的 `target`/`template_id` 须与外层键一致，
+  外层 `name` 须取自其非空侧；comparisons 非空时，非空 `after` 的键集合必须与 findings 完全一致且每项
+  与 findings 同键项深度相等（即 findings 不得有未被比较的当前项），comparisons 可额外携带仅存在于
+  baseline 的 `resolved` 项；plan 的 `target` 唯一且必须存在于当前 findings，单个计划内阶段 `id`
+  唯一，`status`/`reason` 只能是 `ready`/`null`、`skipped`/`missing_requirements` 或
+  `skipped`/`dependency_blocked`。同键出现不同 `name` 亦属不一致。上述错误一律 400
+  `invalid_request`。结构校验完成后，对三类输入中的全部规范化 `target` 沿用现有范围规则，任一越界则
+  整体返回 403 `scope_violation`，不返回局部报告。成功响应仅含 `report`：`schema_version` 为字符串
+  `"1.0"`，`summary` 只含 `targets`、`current_findings`、`persistent`、`resolved`、`new`、
+  `ready_stages`、`skipped_stages` 七个从实际内容计算的计数；`targets` 为分组报告，目标先按 findings
+  首次出现顺序排列，再追加仅见于 comparisons（resolved）的目标，每个目标项只含规范化 `target`、
+  `findings`、`comparisons`、`stages`。空输入返回全零 summary 和空 targets，相同输入产生相同结果。
 
 ## 验证
 
