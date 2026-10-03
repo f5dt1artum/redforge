@@ -77,12 +77,18 @@ _CREDENTIAL_ATTEMPT_FIELDS = frozenset(
 )
 _PAYLOAD_ITEM_FIELDS = frozenset({"id", "template", "variables", "variants"})
 _PAYLOAD_VARIANT_FIELDS = frozenset({"id", "steps"})
+_RATE_LIMIT_POLICY_FIELDS = frozenset({"window_ms", "max_requests", "group_by"})
+_RATE_LIMIT_ATTEMPT_FIELDS = frozenset(
+    {"id", "target", "route", "identity", "timestamp_ms"}
+)
 _SESSION_FIELDS = frozenset({"id", "target", "privilege"})
 _TRANSITION_FIELDS = frozenset({"id", "from", "to", "technique", "cost"})
 _GOAL_FIELDS = frozenset({"id", "target", "min_privilege"})
 
 PRIVILEGES = ("user", "admin", "system")
 _PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
+
+RATE_LIMIT_GROUP_BYS = ("target", "target_route")
 
 PAYLOAD_STEPS = ("url_percent", "base64", "hex")
 # Percent-encoding leaves the RFC 3986 unreserved set untouched.
@@ -1047,6 +1053,63 @@ def _parse_escalation_goal(raw: object, index: int) -> _EscalationGoal:
     if min_privilege not in PRIVILEGES:
         raise ValueError(f"{what}.min_privilege must be one of {PRIVILEGES}")
     return _EscalationGoal(goal_id, target, min_privilege)
+
+
+@dataclass(frozen=True)
+class _RateLimitPolicy:
+    """A validated rate-limit analysis policy."""
+
+    window_ms: int
+    max_requests: int
+    group_by: str
+
+
+@dataclass(frozen=True)
+class _RateLimitAttempt:
+    """A validated request attempt.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in alerts. position is the attempt's input index,
+    used for stable ordering.
+    """
+
+    id: str
+    target: _Entry
+    route: str
+    identity: str
+    timestamp_ms: int
+    position: int
+
+
+def _parse_rate_limit_policy(raw: object) -> _RateLimitPolicy:
+    obj = _require_fields(raw, _RATE_LIMIT_POLICY_FIELDS, "policy")
+    window_ms = obj["window_ms"]
+    if not _is_int(window_ms) or window_ms < 1:
+        raise ValueError("policy.window_ms must be a positive integer")
+    max_requests = obj["max_requests"]
+    if not _is_int(max_requests) or max_requests < 1:
+        raise ValueError("policy.max_requests must be a positive integer")
+    group_by = obj["group_by"]
+    if group_by not in RATE_LIMIT_GROUP_BYS:
+        raise ValueError(f"policy.group_by must be one of {RATE_LIMIT_GROUP_BYS}")
+    return _RateLimitPolicy(window_ms, max_requests, group_by)
+
+
+def _parse_rate_limit_attempt(raw: object, index: int) -> _RateLimitAttempt:
+    what = f"attempts[{index}]"
+    obj = _require_fields(raw, _RATE_LIMIT_ATTEMPT_FIELDS, what)
+    attempt_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    route = obj["route"]
+    if not isinstance(route, str) or not route.startswith("/"):
+        raise ValueError(f"{what}.route must be a non-empty string starting with '/'")
+    identity = _non_empty_str(obj["identity"], f"{what}.identity")
+    timestamp_ms = obj["timestamp_ms"]
+    if not _is_int(timestamp_ms) or timestamp_ms < 0:
+        raise ValueError(f"{what}.timestamp_ms must be a non-negative integer")
+    return _RateLimitAttempt(
+        attempt_id, target, route, identity, timestamp_ms, index
+    )
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2374,3 +2437,110 @@ class Service:
                 "transition_ids": [transition.id for transition in route_transitions],
             },
         }
+
+    def analyze_rate_limit(self, payload: object) -> dict[str, Any]:
+        """Detect rate-limit evasion across recorded request attempts.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (including duplicate attempt ids); only
+        then are attempt targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial results. The same input always
+        produces the same alerts.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "policy", "attempts"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        policy = _parse_rate_limit_policy(payload["policy"])
+
+        raw_attempts = payload["attempts"]
+        if not isinstance(raw_attempts, list):
+            raise ValueError("field attempts must be an array")
+        attempts = [
+            _parse_rate_limit_attempt(raw, i)
+            for i, raw in enumerate(raw_attempts)
+        ]
+        self._require_unique_ids(
+            (attempt.id for attempt in attempts), "attempt"
+        )
+
+        # Scope gate: every attempt target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (attempt.target for attempt in attempts),
+            allow_rules,
+            deny_rules,
+        )
+
+        return {"alerts": self._rate_limit_alerts(attempts, policy)}
+
+    @staticmethod
+    def _rate_limit_alerts(
+        attempts: list[_RateLimitAttempt], policy: _RateLimitPolicy
+    ) -> list[dict[str, Any]]:
+        """Group attempts into fixed windows and flag groups over the limit."""
+        # First-occurrence positions of each normalized target and route
+        # give the alert ordering its stable tie-breaks.
+        target_pos: dict[str, int] = {}
+        route_pos: dict[str, int] = {}
+        for attempt in attempts:
+            target_pos.setdefault(attempt.target.text, attempt.position)
+            route_pos.setdefault(attempt.route, attempt.position)
+
+        groups: dict[tuple[str, int, str | None], list[_RateLimitAttempt]] = {}
+        for attempt in attempts:
+            window_start = (
+                attempt.timestamp_ms // policy.window_ms
+            ) * policy.window_ms
+            route = attempt.route if policy.group_by == "target_route" else None
+            key = (attempt.target.text, window_start, route)
+            groups.setdefault(key, []).append(attempt)
+
+        keyed_alerts: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+        for (target, window_start, route), members in groups.items():
+            if len(members) <= policy.max_requests:
+                continue
+            identity_counts: dict[str, int] = {}
+            for attempt in members:
+                identity_counts[attempt.identity] = (
+                    identity_counts.get(attempt.identity, 0) + 1
+                )
+            distributed = len(identity_counts) >= 2 and all(
+                count <= policy.max_requests
+                for count in identity_counts.values()
+            )
+            ordered = sorted(
+                members, key=lambda attempt: (attempt.timestamp_ms, attempt.position)
+            )
+            alert = {
+                "target": target,
+                "route": route,
+                "window_start_ms": window_start,
+                "window_end_ms": window_start + policy.window_ms,
+                "total_requests": len(members),
+                "identity_counts": [
+                    {"identity": identity, "count": count}
+                    for identity, count in identity_counts.items()
+                ],
+                "kind": (
+                    "distributed_bypass" if distributed else "direct_excess"
+                ),
+                "attempt_ids": [attempt.id for attempt in ordered],
+            }
+            sort_key = (
+                window_start,
+                target_pos[target],
+                route_pos[route] if route is not None else 0,
+            )
+            keyed_alerts.append((sort_key, alert))
+        keyed_alerts.sort(key=lambda item: item[0])
+        return [alert for _, alert in keyed_alerts]
