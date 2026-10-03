@@ -8,6 +8,7 @@ surface here backward compatible.
 from __future__ import annotations
 
 import base64
+import hashlib
 import heapq
 import ipaddress
 import re
@@ -91,6 +92,25 @@ _SAFETY_POLICY_FIELDS = frozenset(
     {"enabled", "window_ms", "max_actions_per_target", "blocked_kinds"}
 )
 _SAFETY_ACTION_FIELDS = frozenset({"id", "target", "kind", "scheduled_ms"})
+_AUDIT_EVENT_FIELDS = frozenset(
+    {"id", "target", "kind", "outcome", "occurred_ms"}
+)
+_AUDIT_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "target",
+        "kind",
+        "outcome",
+        "occurred_ms",
+        "sequence",
+        "previous_hash",
+        "hash",
+    }
+)
+_AUDIT_FIELDS = frozenset({"exercise_id", "records", "head_hash"})
+
+ZERO_HASH = "0" * 64
+_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
@@ -1230,6 +1250,156 @@ def _parse_safety_action(raw: object, index: int) -> _SafetyAction:
     if not _is_int(scheduled_ms) or scheduled_ms < 0:
         raise ValueError(f"{what}.scheduled_ms must be a non-negative integer")
     return _SafetyAction(action_id, target, kind, scheduled_ms)
+
+
+@dataclass(frozen=True)
+class _AuditEvent:
+    """A validated exercise-audit event awaiting chain inclusion.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form recorded in the audit records.
+    """
+
+    id: str
+    target: _Entry
+    kind: str
+    outcome: str
+    occurred_ms: int
+
+
+@dataclass(frozen=True)
+class _AuditRecord:
+    """A validated audit-chain record as accepted by the verify endpoint.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form used when the record hash is recomputed.
+    """
+
+    id: str
+    target: _Entry
+    kind: str
+    outcome: str
+    occurred_ms: int
+    sequence: int
+    previous_hash: str
+    hash: str
+
+
+def _parse_audit_event(raw: object, index: int) -> _AuditEvent:
+    what = f"events[{index}]"
+    obj = _require_fields(raw, _AUDIT_EVENT_FIELDS, what)
+    event_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    kind = _non_empty_str(obj["kind"], f"{what}.kind")
+    outcome = _non_empty_str(obj["outcome"], f"{what}.outcome")
+    occurred_ms = obj["occurred_ms"]
+    if not _is_int(occurred_ms) or occurred_ms < 0:
+        raise ValueError(f"{what}.occurred_ms must be a non-negative integer")
+    return _AuditEvent(event_id, target, kind, outcome, occurred_ms)
+
+
+def _hash_str(value: object, what: str) -> str:
+    if not isinstance(value, str) or not _HASH_RE.fullmatch(value):
+        raise ValueError(f"{what} must be 64 lowercase hex characters")
+    return value
+
+
+def _parse_audit_record(raw: object, index: int) -> _AuditRecord:
+    what = f"audit.records[{index}]"
+    obj = _require_fields(raw, _AUDIT_RECORD_FIELDS, what)
+    record_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    kind = _non_empty_str(obj["kind"], f"{what}.kind")
+    outcome = _non_empty_str(obj["outcome"], f"{what}.outcome")
+    occurred_ms = obj["occurred_ms"]
+    if not _is_int(occurred_ms) or occurred_ms < 0:
+        raise ValueError(f"{what}.occurred_ms must be a non-negative integer")
+    sequence = obj["sequence"]
+    if not _is_int(sequence) or sequence < 0:
+        raise ValueError(f"{what}.sequence must be a non-negative integer")
+    previous_hash = _hash_str(obj["previous_hash"], f"{what}.previous_hash")
+    record_hash = _hash_str(obj["hash"], f"{what}.hash")
+    return _AuditRecord(
+        record_id,
+        target,
+        kind,
+        outcome,
+        occurred_ms,
+        sequence,
+        previous_hash,
+        record_hash,
+    )
+
+
+_JCS_ESCAPES = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _jcs_string(text: str) -> str:
+    """JSON string literal per RFC 8785: minimal escapes, no ASCII folding."""
+    parts = ['"']
+    for char in text:
+        escape = _JCS_ESCAPES.get(char)
+        if escape is not None:
+            parts.append(escape)
+        elif ord(char) < 0x20:
+            parts.append(f"\\u{ord(char):04x}")
+        else:
+            parts.append(char)
+    parts.append('"')
+    return "".join(parts)
+
+
+def _jcs_canonicalize(value: Any) -> bytes:
+    """Serialize a JSON value to its RFC 8785 (JCS) canonical UTF-8 bytes.
+
+    Object keys sort by UTF-16 code unit order; only the JSON types the
+    audit chain uses (objects, arrays, strings, integers, booleans, null)
+    are supported.
+    """
+    if value is None:
+        return b"null"
+    if value is True:
+        return b"true"
+    if value is False:
+        return b"false"
+    if isinstance(value, str):
+        return _jcs_string(value).encode("utf-8")
+    if _is_int(value):
+        return str(value).encode("ascii")
+    if isinstance(value, list):
+        inner = b",".join(_jcs_canonicalize(item) for item in value)
+        return b"[" + inner + b"]"
+    if isinstance(value, dict):
+        members = sorted(
+            value.items(),
+            key=lambda item: item[0].encode("utf-16-be", "surrogatepass"),
+        )
+        inner = b",".join(
+            _jcs_string(key).encode("utf-8") + b":" + _jcs_canonicalize(item)
+            for key, item in members
+        )
+        return b"{" + inner + b"}"
+    raise TypeError(f"cannot canonicalize {type(value).__name__}")
+
+
+def _audit_record_hash(exercise_id: str, record: dict[str, Any]) -> str:
+    """SHA-256 hex of the record without ``hash`` plus ``exercise_id``.
+
+    The record dict must hold every field except ``hash``; the exercise id
+    is mixed in so identical event streams under different exercises hash
+    differently. Bytes come from the RFC 8785 canonical form.
+    """
+    obj = dict(record)
+    obj["exercise_id"] = exercise_id
+    return hashlib.sha256(_jcs_canonicalize(obj)).hexdigest()
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2922,4 +3092,191 @@ class Service:
                 "allowed": allowed_count,
                 "blocked": len(actions) - allowed_count,
             },
+        }
+
+    def build_audit(self, payload: object) -> dict[str, Any]:
+        """Build a deterministic hash-chained audit trail for an exercise.
+
+        Pure, local evaluation: no network access, no action execution, no
+        persistent state, nothing written to disk. All structure is
+        validated first (including duplicate event ids and non-decreasing
+        occurred_ms order); only then are event targets checked against the
+        allow/deny scope. Raises ValueError on malformed input and
+        ScopeViolationError when any target is out of scope; never returns
+        a partial chain. The same input always produces the same audit.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "exercise_id", "events"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        exercise_id = _non_empty_str(payload["exercise_id"], "exercise_id")
+
+        raw_events = payload["events"]
+        if not isinstance(raw_events, list):
+            raise ValueError("field events must be an array")
+        events = [
+            _parse_audit_event(raw, i) for i, raw in enumerate(raw_events)
+        ]
+        self._require_unique_ids((event.id for event in events), "event")
+        self._require_time_order(
+            [event.occurred_ms for event in events], "events"
+        )
+
+        # Scope gate: every event target must be authorized before any
+        # record is chained; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (event.target for event in events),
+            allow_rules,
+            deny_rules,
+        )
+
+        return {"audit": self._build_audit_chain(exercise_id, events)}
+
+    @staticmethod
+    def _require_time_order(timestamps: list[int], what: str) -> None:
+        for previous, current in zip(timestamps, timestamps[1:]):
+            if current < previous:
+                raise ValueError(
+                    f"{what} must be ordered by non-decreasing occurred_ms"
+                )
+
+    @staticmethod
+    def _build_audit_chain(
+        exercise_id: str, events: list[_AuditEvent]
+    ) -> dict[str, Any]:
+        """Chain validated events in input order with linked SHA-256 hashes.
+
+        The first record's previous_hash is the all-zero hash; every later
+        record links to the previous record's hash. An empty event list
+        yields an empty chain whose head_hash is the all-zero hash.
+        """
+        records: list[dict[str, Any]] = []
+        previous_hash = ZERO_HASH
+        for sequence, event in enumerate(events):
+            record: dict[str, Any] = {
+                "id": event.id,
+                "target": event.target.text,
+                "kind": event.kind,
+                "outcome": event.outcome,
+                "occurred_ms": event.occurred_ms,
+                "sequence": sequence,
+                "previous_hash": previous_hash,
+            }
+            record["hash"] = _audit_record_hash(exercise_id, record)
+            previous_hash = record["hash"]
+            records.append(record)
+        return {
+            "exercise_id": exercise_id,
+            "records": records,
+            "head_hash": previous_hash,
+        }
+
+    def verify_audit(self, payload: object) -> dict[str, Any]:
+        """Verify the integrity of an audit chain built by build_audit.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (fields, hash formats, unique event
+        ids, non-decreasing occurred_ms); only then are record targets
+        checked against the allow/deny scope. Raises ValueError on
+        malformed input and ScopeViolationError when any target is out of
+        scope. Chain mismatches are not errors: they are reported in the
+        verification result, stopping at the first inconsistency.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "audit"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        audit = _require_fields(payload["audit"], _AUDIT_FIELDS, "audit")
+        exercise_id = _non_empty_str(audit["exercise_id"], "audit.exercise_id")
+        head_hash = _hash_str(audit["head_hash"], "audit.head_hash")
+        raw_records = audit["records"]
+        if not isinstance(raw_records, list):
+            raise ValueError("audit.records must be an array")
+        records = [
+            _parse_audit_record(raw, i) for i, raw in enumerate(raw_records)
+        ]
+        self._require_unique_ids((record.id for record in records), "event")
+        self._require_time_order(
+            [record.occurred_ms for record in records], "audit.records"
+        )
+
+        # Scope gate: every record target must be authorized before any
+        # hash is checked; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (record.target for record in records),
+            allow_rules,
+            deny_rules,
+        )
+
+        return {
+            "verification": self._verify_audit_chain(
+                exercise_id, records, head_hash
+            )
+        }
+
+    @staticmethod
+    def _verify_audit_chain(
+        exercise_id: str, records: list[_AuditRecord], head_hash: str
+    ) -> dict[str, Any]:
+        """Walk the chain in order and stop at the first inconsistency.
+
+        checked counts the consecutively verified records; the reported
+        head_hash is the last verified record hash, or the all-zero hash
+        when no record passed. A head_hash mismatch is reported at the
+        index one past the last record.
+        """
+        checked = 0
+        previous_hash = ZERO_HASH
+        failure: dict[str, Any] | None = None
+        for index, record in enumerate(records):
+            if record.sequence != index:
+                failure = {"index": index, "reason": "sequence_mismatch"}
+                break
+            if record.previous_hash != previous_hash:
+                failure = {"index": index, "reason": "previous_hash_mismatch"}
+                break
+            expected = _audit_record_hash(
+                exercise_id,
+                {
+                    "id": record.id,
+                    "target": record.target.text,
+                    "kind": record.kind,
+                    "outcome": record.outcome,
+                    "occurred_ms": record.occurred_ms,
+                    "sequence": record.sequence,
+                    "previous_hash": record.previous_hash,
+                },
+            )
+            if record.hash != expected:
+                failure = {"index": index, "reason": "hash_mismatch"}
+                break
+            checked += 1
+            previous_hash = record.hash
+        if failure is None and head_hash != previous_hash:
+            failure = {
+                "index": len(records),
+                "reason": "head_hash_mismatch",
+            }
+        return {
+            "valid": failure is None,
+            "checked": checked,
+            "head_hash": previous_hash,
+            "failure": failure,
         }
