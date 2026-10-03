@@ -8,6 +8,7 @@ surface here backward compatible.
 from __future__ import annotations
 
 import base64
+import heapq
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -76,6 +77,12 @@ _CREDENTIAL_ATTEMPT_FIELDS = frozenset(
 )
 _PAYLOAD_ITEM_FIELDS = frozenset({"id", "template", "variables", "variants"})
 _PAYLOAD_VARIANT_FIELDS = frozenset({"id", "steps"})
+_SESSION_FIELDS = frozenset({"id", "target", "privilege"})
+_TRANSITION_FIELDS = frozenset({"id", "from", "to", "technique", "cost"})
+_GOAL_FIELDS = frozenset({"id", "target", "min_privilege"})
+
+PRIVILEGES = ("user", "admin", "system")
+_PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
 
 PAYLOAD_STEPS = ("url_percent", "base64", "hex")
 # Percent-encoding leaves the RFC 3986 unreserved set untouched.
@@ -972,6 +979,74 @@ def _parse_payload_item(raw: object, index: int) -> _PayloadItem:
         seen_variant_ids.add(variant.id)
     rendered = _render_payload_template(template, variables, what)
     return _PayloadItem(item_id, rendered, tuple(variants))
+
+
+@dataclass(frozen=True)
+class _EscalationSession:
+    """A validated privilege-escalation session node."""
+
+    id: str
+    target: _Entry
+    privilege: str
+
+
+@dataclass(frozen=True)
+class _EscalationTransition:
+    """A validated directed, weighted edge between sessions."""
+
+    id: str
+    source: str
+    destination: str
+    technique: str
+    cost: int
+
+
+@dataclass(frozen=True)
+class _EscalationGoal:
+    """A validated privilege goal: a target at least at min_privilege."""
+
+    id: str
+    target: _Entry
+    min_privilege: str
+
+
+def _parse_escalation_session(raw: object, index: int) -> _EscalationSession:
+    what = f"sessions[{index}]"
+    obj = _require_fields(raw, _SESSION_FIELDS, what)
+    session_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    privilege = obj["privilege"]
+    if privilege not in PRIVILEGES:
+        raise ValueError(f"{what}.privilege must be one of {PRIVILEGES}")
+    return _EscalationSession(session_id, target, privilege)
+
+
+def _parse_escalation_transition(raw: object, index: int) -> _EscalationTransition:
+    what = f"transitions[{index}]"
+    obj = _require_fields(raw, _TRANSITION_FIELDS, what)
+    transition_id = _non_empty_str(obj["id"], f"{what}.id")
+    source = _non_empty_str(obj["from"], f"{what}.from")
+    destination = _non_empty_str(obj["to"], f"{what}.to")
+    if source == destination:
+        raise ValueError(f"{what} must not reference the same session in from and to")
+    technique = _non_empty_str(obj["technique"], f"{what}.technique")
+    cost = obj["cost"]
+    if not _is_int(cost) or not 1 <= cost <= 100:
+        raise ValueError(f"{what}.cost must be an integer between 1 and 100")
+    return _EscalationTransition(
+        transition_id, source, destination, technique, cost
+    )
+
+
+def _parse_escalation_goal(raw: object, index: int) -> _EscalationGoal:
+    what = f"goals[{index}]"
+    obj = _require_fields(raw, _GOAL_FIELDS, what)
+    goal_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    min_privilege = obj["min_privilege"]
+    if min_privilege not in PRIVILEGES:
+        raise ValueError(f"{what}.min_privilege must be one of {PRIVILEGES}")
+    return _EscalationGoal(goal_id, target, min_privilege)
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2102,3 +2177,200 @@ class Service:
                     }
                 )
         return {"generated": generated}
+
+    def compute_escalation_paths(self, payload: object) -> dict[str, Any]:
+        """Compute best paths from start sessions to privilege goals.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first; only then is the normalized target of
+        every session and goal checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial paths.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "sessions", "transitions", "starts", "goals"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        for key in ("sessions", "transitions", "starts", "goals"):
+            if not isinstance(payload[key], list):
+                raise ValueError(f"field {key} must be an array")
+
+        sessions = [
+            _parse_escalation_session(raw, i)
+            for i, raw in enumerate(payload["sessions"])
+        ]
+        self._require_unique_ids((session.id for session in sessions), "session")
+        transitions = [
+            _parse_escalation_transition(raw, i)
+            for i, raw in enumerate(payload["transitions"])
+        ]
+        self._require_unique_ids(
+            (transition.id for transition in transitions), "transition"
+        )
+        goals = [
+            _parse_escalation_goal(raw, i) for i, raw in enumerate(payload["goals"])
+        ]
+        self._require_unique_ids((goal.id for goal in goals), "goal")
+
+        session_ids = {session.id for session in sessions}
+        for i, transition in enumerate(transitions):
+            if transition.source not in session_ids:
+                raise ValueError(
+                    f"transitions[{i}].from references unknown session: "
+                    f"{transition.source!r}"
+                )
+            if transition.destination not in session_ids:
+                raise ValueError(
+                    f"transitions[{i}].to references unknown session: "
+                    f"{transition.destination!r}"
+                )
+
+        seen_starts: set[str] = set()
+        for i, start in enumerate(payload["starts"]):
+            if not isinstance(start, str) or not start:
+                raise ValueError(f"starts[{i}] must be a non-empty string")
+            if start in seen_starts:
+                raise ValueError(f"starts has duplicate session id: {start!r}")
+            seen_starts.add(start)
+            if start not in session_ids:
+                raise ValueError(
+                    f"starts[{i}] references unknown session: {start!r}"
+                )
+
+        # Scope gate: every session and goal target must be authorized before
+        # any path is computed; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (session.target for session in sessions), allow_rules, deny_rules
+        )
+        self._assert_targets_in_scope(
+            (goal.target for goal in goals), allow_rules, deny_rules
+        )
+
+        session_pos = {session.id: i for i, session in enumerate(sessions)}
+        transition_pos = {transition.id: i for i, transition in enumerate(transitions)}
+        start_pos = {start: i for i, start in enumerate(payload["starts"])}
+        outgoing: dict[str, list[_EscalationTransition]] = {
+            session.id: [] for session in sessions
+        }
+        for transition in transitions:
+            outgoing[transition.source].append(transition)
+        sessions_by_id = {session.id: session for session in sessions}
+
+        paths = [
+            self._best_escalation_path(
+                goal,
+                sessions_by_id,
+                outgoing,
+                start_pos,
+                session_pos,
+                transition_pos,
+            )
+            for goal in goals
+        ]
+        return {"paths": paths}
+
+    @staticmethod
+    def _best_escalation_path(
+        goal: _EscalationGoal,
+        sessions_by_id: dict[str, _EscalationSession],
+        outgoing: dict[str, list[_EscalationTransition]],
+        start_pos: dict[str, int],
+        session_pos: dict[str, int],
+        transition_pos: dict[str, int],
+    ) -> dict[str, Any]:
+        """Multi-source Dijkstra ordered by the full path tie-break tuple.
+
+        A route label is (total cost, transition count, start input position,
+        tuple of transition input positions, end session input position).
+        Every transition adds positive cost, so labels strictly grow along an
+        edge and the heap settles routes in non-decreasing label order; the
+        first settled session that satisfies the goal carries the best label,
+        since replacing a node's prefix by a smaller label keeps every suffix
+        comparison smaller.
+        """
+        goal_rank = _PRIVILEGE_RANK[goal.min_privilege]
+        goal_text = goal.target.text
+
+        def satisfies(session: _EscalationSession) -> bool:
+            return (
+                session.target.text == goal_text
+                and _PRIVILEGE_RANK[session.privilege] >= goal_rank
+            )
+
+        # label[node] is the smallest label of a route reaching the node;
+        # parent[node] is the (incoming transition, predecessor) of that route.
+        labels: dict[str, tuple[Any, ...]] = {}
+        parent: dict[str, tuple[_EscalationTransition, str] | None] = {}
+        heap: list[tuple[Any, ...]] = []
+        for start_id, start_index in start_pos.items():
+            label = (0, 0, start_index, (), session_pos[start_id])
+            labels[start_id] = label
+            parent[start_id] = None
+            heapq.heappush(heap, label + (start_id,))
+
+        answer_node: str | None = None
+        while heap:
+            entry = heapq.heappop(heap)
+            label = entry[:-1]
+            node = entry[-1]
+            if labels.get(node) != label:
+                continue  # superseded by a smaller label for the same node
+            if satisfies(sessions_by_id[node]):
+                answer_node = node
+                break
+            for transition in outgoing[node]:
+                neighbor = transition.destination
+                new_label = (
+                    label[0] + transition.cost,
+                    label[1] + 1,
+                    label[2],
+                    label[3] + (transition_pos[transition.id],),
+                    session_pos[neighbor],
+                )
+                current = labels.get(neighbor)
+                if current is None or new_label < current:
+                    labels[neighbor] = new_label
+                    parent[neighbor] = (transition, node)
+                    heapq.heappush(heap, new_label + (neighbor,))
+
+        if answer_node is None:
+            return {
+                "goal_id": goal.id,
+                "target": goal.target.text,
+                "min_privilege": goal.min_privilege,
+                "status": "unreachable",
+                "path": None,
+            }
+
+        route_transitions: list[_EscalationTransition] = []
+        route_nodes = [answer_node]
+        node = answer_node
+        while (link := parent[node]) is not None:
+            transition, predecessor = link
+            route_transitions.append(transition)
+            route_nodes.append(predecessor)
+            node = predecessor
+        route_nodes.reverse()
+        route_transitions.reverse()
+        return {
+            "goal_id": goal.id,
+            "target": goal.target.text,
+            "min_privilege": goal.min_privilege,
+            "status": "reachable",
+            "path": {
+                "start_session_id": route_nodes[0],
+                "end_session_id": answer_node,
+                "total_cost": labels[answer_node][0],
+                "session_ids": route_nodes,
+                "transition_ids": [transition.id for transition in route_transitions],
+            },
+        }

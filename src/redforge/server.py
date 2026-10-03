@@ -18,6 +18,7 @@ PLAN_PATH = "/v1/attack-chains/plan"
 EXPORT_PATH = "/v1/reports/export"
 CREDENTIALS_PATH = "/v1/credentials/analyze"
 PAYLOADS_PATH = "/v1/payloads/generate"
+ESCALATION_PATHS_PATH = "/v1/sessions/escalation-paths"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -28,6 +29,7 @@ POST_PATHS = (
     EXPORT_PATH,
     CREDENTIALS_PATH,
     PAYLOADS_PATH,
+    ESCALATION_PATHS_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -99,6 +101,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == PAYLOADS_PATH:
             self._handle_json_post(self.service.generate_payloads)
+            return
+        if self.path == ESCALATION_PATHS_PATH:
+            self._handle_json_post(self.service.compute_escalation_paths)
             return
         self.not_found()
 
