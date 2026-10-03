@@ -8,6 +8,7 @@ surface here backward compatible.
 from __future__ import annotations
 
 import base64
+import heapq
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ MAX_RULES_PER_FIELD = 1000
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 LOGICS = ("all", "any")
 OPERATORS = ("equals", "contains", "regex")
+PRIVILEGES = ("user", "admin", "system")
 
 # Weakness codes are ordered by the fixed evaluation order; their severities
 # are combined by taking the highest rank per finding.
@@ -76,6 +78,9 @@ _CREDENTIAL_ATTEMPT_FIELDS = frozenset(
 )
 _PAYLOAD_ITEM_FIELDS = frozenset({"id", "template", "variables", "variants"})
 _PAYLOAD_VARIANT_FIELDS = frozenset({"id", "steps"})
+_SESSION_FIELDS = frozenset({"id", "target", "privilege"})
+_TRANSITION_FIELDS = frozenset({"id", "from", "to", "technique", "cost"})
+_GOAL_FIELDS = frozenset({"id", "target", "min_privilege"})
 
 PAYLOAD_STEPS = ("url_percent", "base64", "hex")
 # Percent-encoding leaves the RFC 3986 unreserved set untouched.
@@ -94,6 +99,7 @@ _STAGE_RESULT_COMBOS = frozenset(
 )
 
 _SEVERITY_RANK = {name: index for index, name in enumerate(SEVERITIES)}
+_PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
 
 _LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
@@ -972,6 +978,78 @@ def _parse_payload_item(raw: object, index: int) -> _PayloadItem:
         seen_variant_ids.add(variant.id)
     rendered = _render_payload_template(template, variables, what)
     return _PayloadItem(item_id, rendered, tuple(variants))
+
+
+@dataclass(frozen=True)
+class _Session:
+    """A validated session node in the escalation graph."""
+
+    id: str
+    target: _Entry
+    privilege: str
+
+
+@dataclass(frozen=True)
+class _Transition:
+    """A validated directed edge between two distinct sessions."""
+
+    id: str
+    from_id: str
+    to_id: str
+    technique: str
+    cost: int
+
+
+@dataclass(frozen=True)
+class _Goal:
+    """A validated escalation goal: a target plus a minimum privilege."""
+
+    id: str
+    target: _Entry
+    min_privilege: str
+
+
+def _parse_session(raw: object, index: int) -> _Session:
+    what = f"sessions[{index}]"
+    obj = _require_fields(raw, _SESSION_FIELDS, what)
+    session_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    privilege = obj["privilege"]
+    if privilege not in PRIVILEGES:
+        raise ValueError(f"{what}.privilege must be one of {PRIVILEGES}")
+    return _Session(session_id, target, privilege)
+
+
+def _parse_transition(
+    raw: object, index: int, session_ids: dict[str, int]
+) -> _Transition:
+    what = f"transitions[{index}]"
+    obj = _require_fields(raw, _TRANSITION_FIELDS, what)
+    transition_id = _non_empty_str(obj["id"], f"{what}.id")
+    from_id = obj["from"]
+    if not isinstance(from_id, str) or from_id not in session_ids:
+        raise ValueError(f"{what}.from references an unknown session")
+    to_id = obj["to"]
+    if not isinstance(to_id, str) or to_id not in session_ids:
+        raise ValueError(f"{what}.to references an unknown session")
+    if from_id == to_id:
+        raise ValueError(f"{what} must not reference itself")
+    technique = _non_empty_str(obj["technique"], f"{what}.technique")
+    cost = obj["cost"]
+    if not _is_int(cost) or not 1 <= cost <= 100:
+        raise ValueError(f"{what}.cost must be an integer between 1 and 100")
+    return _Transition(transition_id, from_id, to_id, technique, cost)
+
+
+def _parse_goal(raw: object, index: int) -> _Goal:
+    what = f"goals[{index}]"
+    obj = _require_fields(raw, _GOAL_FIELDS, what)
+    goal_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    min_privilege = obj["min_privilege"]
+    if min_privilege not in PRIVILEGES:
+        raise ValueError(f"{what}.min_privilege must be one of {PRIVILEGES}")
+    return _Goal(goal_id, target, min_privilege)
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2102,3 +2180,191 @@ class Service:
                     }
                 )
         return {"generated": generated}
+
+    def compute_escalation_paths(self, payload: object) -> dict[str, Any]:
+        """Compute the best offline escalation path from starts to each goal.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (including duplicate ids, unknown or
+        self-referencing endpoints, and unknown starts); only then are all
+        session and goal targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial paths.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "sessions", "transitions", "starts", "goals"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_sessions = payload["sessions"]
+        if not isinstance(raw_sessions, list):
+            raise ValueError("field sessions must be an array")
+        sessions = [_parse_session(raw, i) for i, raw in enumerate(raw_sessions)]
+        self._require_unique_ids((session.id for session in sessions), "session")
+        session_index = {session.id: i for i, session in enumerate(sessions)}
+
+        raw_transitions = payload["transitions"]
+        if not isinstance(raw_transitions, list):
+            raise ValueError("field transitions must be an array")
+        transitions = [
+            _parse_transition(raw, i, session_index)
+            for i, raw in enumerate(raw_transitions)
+        ]
+        self._require_unique_ids(
+            (transition.id for transition in transitions), "transition"
+        )
+
+        raw_starts = payload["starts"]
+        if not isinstance(raw_starts, list):
+            raise ValueError("field starts must be an array")
+        starts: list[int] = []
+        seen_starts: set[str] = set()
+        for item in raw_starts:
+            if not isinstance(item, str) or not item:
+                raise ValueError("starts must contain only non-empty strings")
+            if item not in session_index:
+                raise ValueError(f"starts references unknown session id: {item!r}")
+            if item in seen_starts:
+                raise ValueError(f"starts has duplicate entry: {item!r}")
+            seen_starts.add(item)
+            starts.append(session_index[item])
+
+        raw_goals = payload["goals"]
+        if not isinstance(raw_goals, list):
+            raise ValueError("field goals must be an array")
+        goals = [_parse_goal(raw, i) for i, raw in enumerate(raw_goals)]
+        self._require_unique_ids((goal.id for goal in goals), "goal")
+
+        # Scope gate: every session and goal target must be authorized before
+        # any path is computed; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            [session.target for session in sessions]
+            + [goal.target for goal in goals],
+            allow_rules,
+            deny_rules,
+        )
+
+        settled, parents = self._best_session_paths(
+            sessions, transitions, starts, session_index
+        )
+        return {
+            "paths": [
+                self._goal_path(goal, sessions, transitions, settled, parents)
+                for goal in goals
+            ]
+        }
+
+    @staticmethod
+    def _best_session_paths(
+        sessions: list[_Session],
+        transitions: list[_Transition],
+        starts: list[int],
+        session_index: dict[str, int],
+    ) -> tuple[dict[int, tuple], dict[int, tuple[int, int]]]:
+        """Multi-source Dijkstra over the session graph.
+
+        Path keys are (total_cost, transition_count, start_position,
+        transition_index_sequence). Extending a path by one transition keeps
+        the key order, so the first time a session is popped its key (and
+        parent chain) is final. Returns the settled key per session index
+        plus each settled session's (previous session, transition) parent.
+        """
+        adjacency: list[list[tuple[int, int, int]]] = [[] for _ in sessions]
+        for t_index, transition in enumerate(transitions):
+            adjacency[session_index[transition.from_id]].append(
+                (transition.cost, t_index, session_index[transition.to_id])
+            )
+        best: dict[int, tuple] = {}
+        parents: dict[int, tuple[int, int]] = {}
+        heap: list[tuple[tuple, int]] = []
+        for position, node in enumerate(starts):
+            key = (0, 0, position, ())
+            best[node] = key
+            heapq.heappush(heap, (key, node))
+        settled: dict[int, tuple] = {}
+        while heap:
+            key, node = heapq.heappop(heap)
+            if node in settled:
+                continue
+            settled[node] = key
+            cost, count, position, sequence = key
+            for edge_cost, t_index, neighbor in adjacency[node]:
+                if neighbor in settled:
+                    continue
+                candidate = (
+                    cost + edge_cost,
+                    count + 1,
+                    position,
+                    sequence + (t_index,),
+                )
+                if neighbor not in best or candidate < best[neighbor]:
+                    best[neighbor] = candidate
+                    parents[neighbor] = (node, t_index)
+                    heapq.heappush(heap, (candidate, neighbor))
+        return settled, parents
+
+    @staticmethod
+    def _goal_path(
+        goal: _Goal,
+        sessions: list[_Session],
+        transitions: list[_Transition],
+        settled: dict[int, tuple],
+        parents: dict[int, tuple[int, int]],
+    ) -> dict[str, Any]:
+        """Pick the best reachable session satisfying one goal."""
+        min_rank = _PRIVILEGE_RANK[goal.min_privilege]
+        choice: tuple[tuple, int] | None = None
+        for index, session in enumerate(sessions):
+            key = settled.get(index)
+            if key is None:
+                continue
+            if session.target.text != goal.target.text:
+                continue
+            if _PRIVILEGE_RANK[session.privilege] < min_rank:
+                continue
+            # The end session's input position is the final tie-break.
+            candidate = (key, index)
+            if choice is None or candidate < choice:
+                choice = candidate
+        result: dict[str, Any] = {
+            "goal_id": goal.id,
+            "target": goal.target.text,
+            "min_privilege": goal.min_privilege,
+        }
+        if choice is None:
+            result.update({"status": "unreachable", "path": None})
+            return result
+        key, end_index = choice
+        session_ids: list[str] = []
+        transition_ids: list[str] = []
+        node = end_index
+        while True:
+            session_ids.append(sessions[node].id)
+            if node not in parents:
+                break
+            previous, t_index = parents[node]
+            transition_ids.append(transitions[t_index].id)
+            node = previous
+        session_ids.reverse()
+        transition_ids.reverse()
+        result.update(
+            {
+                "status": "reachable",
+                "path": {
+                    "start_session_id": session_ids[0],
+                    "end_session_id": sessions[end_index].id,
+                    "total_cost": key[0],
+                    "session_ids": session_ids,
+                    "transition_ids": transition_ids,
+                },
+            }
+        )
+        return result

@@ -111,6 +111,21 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   每项仅含 `item_id`、`variant_id`、规范化 `target`、原顺序 `steps` 和 `value`。空 `steps` 返回替换后的
   原文；空 `items` 或 item 无 variant 时返回空数组；value 相同但标识不同的结果不合并，相同输入始终产生
   相同内容与顺序。
+- `POST /v1/sessions/escalation-paths`：离线计算会话到权限目标的最佳提权路径，不联网、不持久化。请求体
+  仅含 `allow`、`deny`、`sessions`、`transitions`、`starts`、`goals`，各数组均可为空。每个 session 仅含
+  唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、取值 `user`/`admin`/`system` 的 `privilege`
+  （权限由低到高同序）；每个 transition 仅含唯一非空 `id`、引用已有会话且不得自指的 `from`/`to`、非空
+  `technique`、1–100 的非布尔整数 `cost`；`starts` 是无重复的会话 id 数组；每个 goal 仅含唯一非空 `id`、
+  `target`、`min_privilege`。先完成全部结构校验（字段缺失或未知、类型错误、重复 id、未知或自指端点、
+  非法 cost 等均返回 400 `invalid_request`），再按既有 allow/deny 语义检查全部 session 与 goal 的规范化
+  `target`，任一越界则整体返回 403 `scope_violation`，不返回局部路径。图可含环、跨目标边及同一对会话间
+  的多条 transition；goal 仅由规范化 `target` 相同且 `privilege` 不低于 `min_privilege` 的会话满足。成功
+  响应仅含与 `goals` 同序的 `paths`，每项含 `goal_id`、规范化 `target`、`min_privilege`、`status`、
+  `path`；不可达时 `status` 为 `unreachable` 且 `path` 为 `null`，可达时 `path` 仅含
+  `start_session_id`、`end_session_id`、`total_cost`、按行进顺序的 `session_ids` 与 `transition_ids`
+  （起点即满足目标时 `total_cost` 为 0、`transition_ids` 为空）。最佳路径依次按总 cost、transition 数、
+  start 输入位置、沿途 transition 输入位置序列、终点 session 输入位置由小到大决胜；相同输入始终产生相同
+  结果。
 
 ## 验证
 
