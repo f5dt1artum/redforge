@@ -68,6 +68,20 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
   每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
   `findings` 返回空 `plans`，相同输入的数组顺序稳定。
+- `POST /v1/credentials/analyze`：离线分析凭证观测中的弱口令，不联网、不持久化口令。请求体仅含 `allow`、
+  `deny`、`policy`、`attempts`；`policy` 仅含 `min_length`（1–128 的非布尔整数）和 `weak_secrets`
+  （元素唯一的非空字符串非空数组）；`attempts` 可为空数组，每项仅含唯一非空 `id`、`target`（沿用既有
+  目标语法，不得为通配符）、`port`（1–65535 的非布尔整数）、`transport`（仅 `tcp` 或 `udp`）、非空
+  `service`、非空 `username`、字符串 `secret` 和布尔 `authenticated`。先完成全部结构校验（结构错误、
+  `id` 或 `weak_secrets` 重复、目标或范围规则非法均返回 400 `invalid_request`），再对每个规范化
+  `target` 执行范围评估，任一越界则整体返回 403 `scope_violation`，不返回局部结果。仅
+  `authenticated` 为 `true` 且命中条件的观测产生 finding：`secret` 为空命中 `empty_secret`，与
+  `username` 大小写敏感地相同命中 `username_equals_secret`，等于 `weak_secrets` 任一值命中
+  `dictionary_secret`，Unicode 码点数小于 `min_length` 命中 `short_secret`；同一观测可命中多项，
+  `weakness_codes` 依此次序，四项 severity 依次为 `critical`、`critical`、`high`、`medium`，最终取
+  最高级。成功响应仅含 `findings`（顺序与 `attempts` 一致），每项仅含 `attempt_id`、规范化
+  `target`、`port`、`transport`、`service`、`username`、`severity`、`weakness_codes`；响应与错误均不
+  泄露 `secret` 或 `weak_secrets` 内容；未认证、未命中或空 `attempts` 均返回空 `findings`。
 - `POST /v1/reports/export`：把既有结果导出为单一稳定的证据报告，纯本地处理。请求体仅含 `allow`、`deny`、
   `title`、`findings`、`comparisons`、`plans`；`title` 为非空字符串，后三项分别沿用 consolidate、retest 和
   attack-chains/plan 的结果项，均为可空数组。先完成结构及交叉一致性校验：以规范化 `target` 与区分大小写的

@@ -51,6 +51,34 @@ _COMPARISON_FIELDS = frozenset(
 )
 _PLAN_FIELDS = frozenset({"target", "stages"})
 _STAGE_RESULT_FIELDS = frozenset({"id", "name", "status", "reason"})
+_POLICY_FIELDS = frozenset({"min_length", "weak_secrets"})
+_ATTEMPT_FIELDS = frozenset(
+    {
+        "id",
+        "target",
+        "port",
+        "transport",
+        "service",
+        "username",
+        "secret",
+        "authenticated",
+    }
+)
+
+# weakness_codes always appear in this order; severity is the highest rank
+# among the hit codes.
+WEAKNESS_CODES = (
+    "empty_secret",
+    "username_equals_secret",
+    "dictionary_secret",
+    "short_secret",
+)
+_WEAKNESS_SEVERITY = {
+    "empty_secret": "critical",
+    "username_equals_secret": "critical",
+    "dictionary_secret": "high",
+    "short_secret": "medium",
+}
 
 COMPARISON_STATUSES = ("persistent", "resolved", "new")
 _STAGE_RESULT_COMBOS = frozenset(
@@ -430,6 +458,90 @@ def _parse_port_observation(raw: object, index: int) -> _PortObservation:
     if not isinstance(banner, str):
         raise ValueError(f"{what}.banner must be a string")
     return _PortObservation(observation_id, target, port, transport, banner)
+
+
+@dataclass(frozen=True)
+class _CredentialPolicy:
+    """A validated credential-analysis policy.
+
+    weak_secrets is a frozenset of distinct non-empty strings; its contents
+    are never echoed back in responses or error messages.
+    """
+
+    min_length: int
+    weak_secrets: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _CredentialAttempt:
+    """A validated credential observation.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in findings. secret is never reported back.
+    """
+
+    id: str
+    target: _Entry
+    port: int
+    transport: str
+    service: str
+    username: str
+    secret: str
+    authenticated: bool
+
+
+def _parse_credential_policy(raw: object) -> _CredentialPolicy:
+    obj = _require_fields(raw, _POLICY_FIELDS, "policy")
+    min_length = obj["min_length"]
+    if not _is_int(min_length) or not 1 <= min_length <= 128:
+        raise ValueError(
+            "policy.min_length must be an integer between 1 and 128"
+        )
+    weak_secrets = obj["weak_secrets"]
+    if not isinstance(weak_secrets, list) or not weak_secrets:
+        raise ValueError("policy.weak_secrets must be a non-empty array")
+    seen: set[str] = set()
+    for item in weak_secrets:
+        if not isinstance(item, str) or not item:
+            raise ValueError(
+                "policy.weak_secrets must contain only non-empty strings"
+            )
+        if item in seen:
+            # Do not echo the secret value in the error message.
+            raise ValueError("policy.weak_secrets has duplicate entries")
+        seen.add(item)
+    return _CredentialPolicy(min_length, frozenset(weak_secrets))
+
+
+def _parse_credential_attempt(raw: object, index: int) -> _CredentialAttempt:
+    what = f"attempts[{index}]"
+    obj = _require_fields(raw, _ATTEMPT_FIELDS, what)
+    attempt_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    port = obj["port"]
+    if not _is_int(port) or not 1 <= port <= 65535:
+        raise ValueError(f"{what}.port must be an integer between 1 and 65535")
+    transport = obj["transport"]
+    if transport not in ("tcp", "udp"):
+        raise ValueError(f"{what}.transport must be 'tcp' or 'udp'")
+    service = _non_empty_str(obj["service"], f"{what}.service")
+    username = _non_empty_str(obj["username"], f"{what}.username")
+    secret = obj["secret"]
+    if not isinstance(secret, str):
+        raise ValueError(f"{what}.secret must be a string")
+    authenticated = obj["authenticated"]
+    if not isinstance(authenticated, bool):
+        raise ValueError(f"{what}.authenticated must be a boolean")
+    return _CredentialAttempt(
+        attempt_id,
+        target,
+        port,
+        transport,
+        service,
+        username,
+        secret,
+        authenticated,
+    )
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1185,92 @@ class Service:
                 }
             )
         return service
+
+    def analyze_credentials(self, payload: object) -> dict[str, Any]:
+        """Analyze offline credential observations for weak secrets.
+
+        Pure, local evaluation: no network access, no persistent state, and
+        secrets are never echoed in responses or error messages. All
+        structure is validated first (including duplicate attempt ids and
+        duplicate weak_secrets entries); only then are attempt targets
+        checked against the allow/deny scope. Raises ValueError on malformed
+        input and ScopeViolationError when any target is out of scope; never
+        returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "policy", "attempts"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        policy = _parse_credential_policy(payload["policy"])
+
+        raw_attempts = payload["attempts"]
+        if not isinstance(raw_attempts, list):
+            raise ValueError("field attempts must be an array")
+        attempts = [
+            _parse_credential_attempt(raw, i)
+            for i, raw in enumerate(raw_attempts)
+        ]
+        self._require_unique_ids(
+            (attempt.id for attempt in attempts), "attempt"
+        )
+
+        # Scope gate: every attempt target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (attempt.target for attempt in attempts),
+            allow_rules,
+            deny_rules,
+        )
+
+        findings: list[dict[str, Any]] = []
+        for attempt in attempts:
+            if not attempt.authenticated:
+                continue
+            codes = [
+                code
+                for code in WEAKNESS_CODES
+                if self._weakness_hit(code, attempt, policy)
+            ]
+            if not codes:
+                continue
+            severity = max(
+                (_WEAKNESS_SEVERITY[code] for code in codes),
+                key=_SEVERITY_RANK.__getitem__,
+            )
+            findings.append(
+                {
+                    "attempt_id": attempt.id,
+                    "target": attempt.target.text,
+                    "port": attempt.port,
+                    "transport": attempt.transport,
+                    "service": attempt.service,
+                    "username": attempt.username,
+                    "severity": severity,
+                    "weakness_codes": codes,
+                }
+            )
+        return {"findings": findings}
+
+    @staticmethod
+    def _weakness_hit(
+        code: str, attempt: _CredentialAttempt, policy: _CredentialPolicy
+    ) -> bool:
+        if code == "empty_secret":
+            return not attempt.secret
+        if code == "username_equals_secret":
+            return attempt.secret == attempt.username
+        if code == "dictionary_secret":
+            return attempt.secret in policy.weak_secrets
+        # short_secret: length is counted in Unicode code points.
+        return len(attempt.secret) < policy.min_length
 
     def consolidate_findings(self, payload: object) -> dict[str, Any]:
         """Consolidate matched findings collected across multiple scans.
