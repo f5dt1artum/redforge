@@ -87,8 +87,14 @@ _RATE_LIMIT_ATTEMPT_FIELDS = frozenset(
 _SCHEDULE_REQUEST_FIELDS = frozenset(
     {"id", "target", "route", "earliest_ms", "depends_on"}
 )
+_SAFETY_POLICY_FIELDS = frozenset(
+    {"enabled", "window_ms", "max_actions_per_target", "blocked_kinds"}
+)
+_SAFETY_ACTION_FIELDS = frozenset({"id", "target", "kind", "scheduled_ms"})
 
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
+
+SAFETY_KINDS = ("discovery", "verification", "exploitation", "credential", "privilege")
 
 PRIVILEGES = ("user", "admin", "system")
 _PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
@@ -1158,6 +1164,72 @@ def _parse_scheduled_request(raw: object, index: int) -> _ScheduledRequest:
     return _ScheduledRequest(
         request_id, target, route, earliest_ms, tuple(depends_on)
     )
+
+
+@dataclass(frozen=True)
+class _SafetyPolicy:
+    """A validated exercise safety-evaluation policy."""
+
+    enabled: bool
+    window_ms: int
+    max_actions_per_target: int
+    blocked_kinds: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _SafetyAction:
+    """A validated exercise action awaiting a safety decision.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in decisions.
+    """
+
+    id: str
+    target: _Entry
+    kind: str
+    scheduled_ms: int
+
+
+def _parse_safety_policy(raw: object) -> _SafetyPolicy:
+    obj = _require_fields(raw, _SAFETY_POLICY_FIELDS, "policy")
+    enabled = obj["enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError("policy.enabled must be a boolean")
+    window_ms = obj["window_ms"]
+    if not _is_int(window_ms) or window_ms < 1:
+        raise ValueError("policy.window_ms must be a positive integer")
+    max_actions = obj["max_actions_per_target"]
+    if not _is_int(max_actions) or max_actions < 1:
+        raise ValueError("policy.max_actions_per_target must be a positive integer")
+    raw_blocked = obj["blocked_kinds"]
+    if not isinstance(raw_blocked, list):
+        raise ValueError("policy.blocked_kinds must be an array")
+    blocked: list[str] = []
+    seen: set[str] = set()
+    for kind in raw_blocked:
+        if kind not in SAFETY_KINDS:
+            raise ValueError(
+                f"policy.blocked_kinds must contain only kinds from {SAFETY_KINDS}"
+            )
+        if kind in seen:
+            raise ValueError(f"policy.blocked_kinds has duplicate entry: {kind!r}")
+        seen.add(kind)
+        blocked.append(kind)
+    return _SafetyPolicy(enabled, window_ms, max_actions, frozenset(blocked))
+
+
+def _parse_safety_action(raw: object, index: int) -> _SafetyAction:
+    what = f"actions[{index}]"
+    obj = _require_fields(raw, _SAFETY_ACTION_FIELDS, what)
+    action_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    kind = obj["kind"]
+    if kind not in SAFETY_KINDS:
+        raise ValueError(f"{what}.kind must be one of {SAFETY_KINDS}")
+    scheduled_ms = obj["scheduled_ms"]
+    if not _is_int(scheduled_ms) or scheduled_ms < 0:
+        raise ValueError(f"{what}.scheduled_ms must be a non-negative integer")
+    return _SafetyAction(action_id, target, kind, scheduled_ms)
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2754,3 +2826,100 @@ class Service:
                 }
             )
         return results
+
+    def safety_evaluate(self, payload: object) -> dict[str, Any]:
+        """Decide whether each planned exercise action may proceed.
+
+        Pure, local evaluation: no network access, no action execution, no
+        persistent state. All structure is validated first (including
+        duplicate action ids and duplicate blocked kinds); only then are
+        action targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial decisions. The same input
+        always produces the same decisions.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "policy", "actions"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        policy = _parse_safety_policy(payload["policy"])
+
+        raw_actions = payload["actions"]
+        if not isinstance(raw_actions, list):
+            raise ValueError("field actions must be an array")
+        actions = [
+            _parse_safety_action(raw, i) for i, raw in enumerate(raw_actions)
+        ]
+        self._require_unique_ids((action.id for action in actions), "action")
+
+        # Scope gate: every action target must be authorized before any
+        # decision is made; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (action.target for action in actions),
+            allow_rules,
+            deny_rules,
+        )
+
+        return self._evaluate_safety(actions, policy)
+
+    @staticmethod
+    def _evaluate_safety(
+        actions: list[_SafetyAction], policy: _SafetyPolicy
+    ) -> dict[str, Any]:
+        """Decide actions in input order against the safety policy.
+
+        A disabled policy blocks everything with emergency_stop; otherwise a
+        blocked kind is rejected before quota accounting. Remaining actions
+        consume one slot of their normalized target's fixed window; the first
+        max_actions_per_target per target per window pass, the rest are
+        blocked with action_limit. emergency_stop and blocked_kind decisions
+        never consume quota.
+        """
+        decisions: list[dict[str, Any]] = []
+        occupancy: dict[tuple[str, int], int] = {}
+        allowed_count = 0
+        for action in actions:
+            status = "allowed"
+            reason: str | None = None
+            if not policy.enabled:
+                status, reason = "blocked", "emergency_stop"
+            elif action.kind in policy.blocked_kinds:
+                status, reason = "blocked", "blocked_kind"
+            else:
+                window_start = (
+                    action.scheduled_ms // policy.window_ms
+                ) * policy.window_ms
+                key = (action.target.text, window_start)
+                count = occupancy.get(key, 0)
+                if count >= policy.max_actions_per_target:
+                    status, reason = "blocked", "action_limit"
+                else:
+                    occupancy[key] = count + 1
+            if reason is None:
+                allowed_count += 1
+            decisions.append(
+                {
+                    "id": action.id,
+                    "target": action.target.text,
+                    "kind": action.kind,
+                    "scheduled_ms": action.scheduled_ms,
+                    "status": status,
+                    "reason": reason,
+                }
+            )
+        return {
+            "decisions": decisions,
+            "summary": {
+                "total": len(actions),
+                "allowed": allowed_count,
+                "blocked": len(actions) - allowed_count,
+            },
+        }
