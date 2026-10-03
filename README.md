@@ -126,6 +126,21 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `transition_ids`，序列按行进顺序排列。起始会话直接满足目标时 total_cost 为 0、transition_ids 为空。最佳路径
   依次按总 cost、transition 数、start 输入位置、沿途 transition 输入位置序列、终点 session 输入位置由小到大
   决胜；相同输入始终产生相同结果。
+- `POST /v1/requests/rate-limit-analyze`：离线分析请求观测中的限速超限与更换身份分摊流量的规避行为，不联网、
+  不持久化。请求体仅含 `allow`、`deny`、`policy`、`attempts`；`policy` 仅含 `window_ms` 与
+  `max_requests`（均为正的非布尔整数）和 `group_by`（仅 `target` 或 `target_route`）；`attempts` 可为空
+  数组，每项仅含唯一非空 `id`、沿用既有目标语法且不得为通配符的 `target`、以 `/` 开头的非空 `route`、
+  非空 `identity` 和非负非布尔整数 `timestamp_ms`，不接受多余字段。先完成全部结构校验（字段缺失或多余、
+  重复 `id`、非法值均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个尝试的规范化
+  `target`，任一越界则整体返回 403 `scope_violation`，不返回局部结果。窗口起点为
+  `floor(timestamp_ms / window_ms) * window_ms`；`group_by` 为 `target` 时按规范化目标与窗口分组，为
+  `target_route` 时再按大小写敏感的 `route` 细分。组内总数大于 `max_requests` 才产生告警：组内至少两个
+  `identity` 且每个身份的计数都不超过 `max_requests` 时 `kind` 为 `distributed_bypass`，否则为
+  `direct_excess`。成功响应仅含 `alerts`，按窗口起点、目标首次出现位置、route 首次出现位置排序；每项仅含
+  规范化 `target`、`route`（`target` 分组时为 `null`）、`window_start_ms`、`window_end_ms`（起点加
+  `window_ms`）、`total_requests`、`identity_counts`（按身份首次出现顺序给出 `identity` 与 `count`）、
+  `kind`、`attempt_ids`（按 `timestamp_ms` 升序，并列按输入顺序）。空 `attempts` 或无超限时返回空
+  `alerts`；相同输入始终产生相同结果。
 
 ## 验证
 

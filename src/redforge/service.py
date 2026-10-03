@@ -80,6 +80,12 @@ _PAYLOAD_VARIANT_FIELDS = frozenset({"id", "steps"})
 _SESSION_FIELDS = frozenset({"id", "target", "privilege"})
 _TRANSITION_FIELDS = frozenset({"id", "from", "to", "technique", "cost"})
 _GOAL_FIELDS = frozenset({"id", "target", "min_privilege"})
+_RATE_LIMIT_POLICY_FIELDS = frozenset({"window_ms", "max_requests", "group_by"})
+_RATE_LIMIT_ATTEMPT_FIELDS = frozenset(
+    {"id", "target", "route", "identity", "timestamp_ms"}
+)
+
+RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
 PRIVILEGES = ("user", "admin", "system")
 _PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
@@ -1047,6 +1053,61 @@ def _parse_escalation_goal(raw: object, index: int) -> _EscalationGoal:
     if min_privilege not in PRIVILEGES:
         raise ValueError(f"{what}.min_privilege must be one of {PRIVILEGES}")
     return _EscalationGoal(goal_id, target, min_privilege)
+
+
+@dataclass(frozen=True)
+class _RateLimitPolicy:
+    """A validated rate-limit-analysis policy."""
+
+    window_ms: int
+    max_requests: int
+    group_by: str
+
+
+@dataclass(frozen=True)
+class _RateLimitAttempt:
+    """A validated rate-limit request observation.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in alerts.
+    """
+
+    id: str
+    target: _Entry
+    route: str
+    identity: str
+    timestamp_ms: int
+
+
+def _parse_rate_limit_policy(raw: object) -> _RateLimitPolicy:
+    obj = _require_fields(raw, _RATE_LIMIT_POLICY_FIELDS, "policy")
+    window_ms = obj["window_ms"]
+    if not _is_int(window_ms) or window_ms < 1:
+        raise ValueError("policy.window_ms must be a positive integer")
+    max_requests = obj["max_requests"]
+    if not _is_int(max_requests) or max_requests < 1:
+        raise ValueError("policy.max_requests must be a positive integer")
+    group_by = obj["group_by"]
+    if group_by not in RATE_LIMIT_GROUPINGS:
+        raise ValueError(f"policy.group_by must be one of {RATE_LIMIT_GROUPINGS}")
+    return _RateLimitPolicy(window_ms, max_requests, group_by)
+
+
+def _parse_rate_limit_attempt(raw: object, index: int) -> _RateLimitAttempt:
+    what = f"attempts[{index}]"
+    obj = _require_fields(raw, _RATE_LIMIT_ATTEMPT_FIELDS, what)
+    attempt_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    route = obj["route"]
+    if not isinstance(route, str) or not route.startswith("/"):
+        raise ValueError(
+            f"{what}.route must be a non-empty string starting with '/'"
+        )
+    identity = _non_empty_str(obj["identity"], f"{what}.identity")
+    timestamp_ms = obj["timestamp_ms"]
+    if not _is_int(timestamp_ms) or timestamp_ms < 0:
+        raise ValueError(f"{what}.timestamp_ms must be a non-negative integer")
+    return _RateLimitAttempt(attempt_id, target, route, identity, timestamp_ms)
 
 
 def _url_percent_encode(text: str) -> str:
@@ -2374,3 +2435,121 @@ class Service:
                 "transition_ids": [transition.id for transition in route_transitions],
             },
         }
+
+    def analyze_rate_limit(self, payload: object) -> dict[str, Any]:
+        """Detect rate-limit saturation and distributed identity-splitting.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (including duplicate attempt ids); only
+        then are attempt targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial results. The same input always
+        produces the same alerts.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "policy", "attempts"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        policy = _parse_rate_limit_policy(payload["policy"])
+
+        raw_attempts = payload["attempts"]
+        if not isinstance(raw_attempts, list):
+            raise ValueError("field attempts must be an array")
+        attempts = [
+            _parse_rate_limit_attempt(raw, i)
+            for i, raw in enumerate(raw_attempts)
+        ]
+        self._require_unique_ids(
+            (attempt.id for attempt in attempts), "attempt"
+        )
+
+        # Scope gate: every attempt target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (attempt.target for attempt in attempts),
+            allow_rules,
+            deny_rules,
+        )
+
+        return {"alerts": self._rate_limit_alerts(attempts, policy)}
+
+    @staticmethod
+    def _rate_limit_alerts(
+        attempts: list[_RateLimitAttempt], policy: _RateLimitPolicy
+    ) -> list[dict[str, Any]]:
+        """Group attempts into fixed windows and flag groups over the limit.
+
+        Groups key on the normalized target and the window start, plus the
+        case-sensitive route when the policy groups by target_route. Only a
+        group whose total exceeds max_requests alerts; the kind is
+        distributed_bypass when at least two identities share the group and
+        no single identity exceeds the limit on its own.
+        """
+        target_pos: dict[str, int] = {}
+        route_pos: dict[str, int] = {}
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for index, attempt in enumerate(attempts):
+            target_pos.setdefault(attempt.target.text, index)
+            route_pos.setdefault(attempt.route, index)
+            window_start = (
+                attempt.timestamp_ms // policy.window_ms
+            ) * policy.window_ms
+            if policy.group_by == "target_route":
+                key: tuple[Any, ...] = (
+                    attempt.target.text,
+                    attempt.route,
+                    window_start,
+                )
+            else:
+                key = (attempt.target.text, None, window_start)
+            groups.setdefault(key, []).append(index)
+
+        alerts: list[dict[str, Any]] = []
+        for (target, route, window_start), indexes in groups.items():
+            if len(indexes) <= policy.max_requests:
+                continue
+            identity_counts: dict[str, int] = {}
+            for index in indexes:
+                identity = attempts[index].identity
+                identity_counts[identity] = identity_counts.get(identity, 0) + 1
+            distributed = len(identity_counts) >= 2 and all(
+                count <= policy.max_requests
+                for count in identity_counts.values()
+            )
+            # indexes are in input order, so the stable sort breaks
+            # timestamp ties by input position.
+            ordered = sorted(indexes, key=lambda i: attempts[i].timestamp_ms)
+            alerts.append(
+                {
+                    "target": target,
+                    "route": route,
+                    "window_start_ms": window_start,
+                    "window_end_ms": window_start + policy.window_ms,
+                    "total_requests": len(indexes),
+                    "identity_counts": [
+                        {"identity": identity, "count": count}
+                        for identity, count in identity_counts.items()
+                    ],
+                    "kind": (
+                        "distributed_bypass" if distributed else "direct_excess"
+                    ),
+                    "attempt_ids": [attempts[i].id for i in ordered],
+                    "_sort": (
+                        window_start,
+                        target_pos[target],
+                        route_pos[route] if route is not None else 0,
+                    ),
+                }
+            )
+        alerts.sort(key=lambda alert: alert["_sort"])
+        for alert in alerts:
+            del alert["_sort"]
+        return alerts
