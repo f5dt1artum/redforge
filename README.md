@@ -96,6 +96,21 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   finding 的 `severity` 取其中最高级。成功响应仅含 `findings`，顺序与 `attempts` 一致；每项只含
   `attempt_id`、规范化 `target`、`port`、`transport`、`service`、`username`、`severity`、
   `weakness_codes`。未认证、未命中或空 `attempts` 均得到空 `findings`。
+- `POST /v1/payloads/generate`：离线生成确定性载荷变体，不联网、不执行载荷、不持久化任何内容。请求体仅含
+  `allow`、`deny`、`target`、`items`；`target` 沿用既有目标语法且不得为通配符，`items` 可为空数组。
+  每个 item 仅含该请求内唯一非空 `id`、非空 `template`、`variables` 和 `variants`；`variables` 是变量名
+  （匹配 `[A-Za-z_][A-Za-z0-9_]*`）到字符串的对象。`template` 用 `${name}` 引用变量，引用缺值、存在多余
+  变量或出现畸形占位符均令请求无效；替换只进行一次，变量值中的 `${...}` 不再展开。每个 variant 仅含该 item
+  内唯一非空 `id` 和 `steps`；`steps` 可为空数组，元素只能是 `url_percent`、`base64`、`hex`，可重复并
+  按顺序应用，未知步骤令请求无效。各变体均从该 item 替换后的文本独立开始：`url_percent` 先编码为 UTF-8，
+  ASCII 字母、数字及 `-._~` 原样保留，其余字节写成大写 `%HH`；`base64` 输出 UTF-8 字节的标准 Base64 并
+  保留 `=` 填充；`hex` 输出 UTF-8 字节的小写十六进制且不带前缀；前一步输出供下一步处理。先完成全部结构
+  校验（字段缺失或未知、类型错误、重复标识、非法变量、占位符错误、未知步骤均返回 400
+  `invalid_request`），再按既有 allow/deny 语义检查单个规范化 target，未授权时整体返回 403
+  `scope_violation`；`items` 为空仍检查范围。成功响应仅含 `generated`，按 items、variants 输入顺序排列；
+  每项仅含 `item_id`、`variant_id`、规范化 `target`、原顺序 `steps` 和 `value`。空 `steps` 返回替换后的
+  原文；空 `items` 或 item 无 variant 时返回空数组；value 相同但标识不同的结果不合并，相同输入始终产生
+  相同内容与顺序。
 
 ## 验证
 

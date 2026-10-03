@@ -7,6 +7,7 @@ surface here backward compatible.
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -73,6 +74,15 @@ _CREDENTIAL_ATTEMPT_FIELDS = frozenset(
         "authenticated",
     }
 )
+_PAYLOAD_ITEM_FIELDS = frozenset({"id", "template", "variables", "variants"})
+_PAYLOAD_VARIANT_FIELDS = frozenset({"id", "steps"})
+
+PAYLOAD_STEPS = ("url_percent", "base64", "hex")
+# Percent-encoding leaves the RFC 3986 unreserved set untouched.
+_PERCENT_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 COMPARISON_STATUSES = ("persistent", "resolved", "new")
 _STAGE_RESULT_COMBOS = frozenset(
@@ -867,6 +877,127 @@ def _port_matcher_hit(matcher: _PortMatcher, observation: _PortObservation) -> b
     if matcher.kind == "transport":
         return observation.transport == matcher.value
     return _apply_operator(matcher, observation.banner)
+
+
+@dataclass(frozen=True)
+class _PayloadVariant:
+    """A validated payload variant: an ordered chain of encoding steps."""
+
+    id: str
+    steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PayloadItem:
+    """A validated payload item with its template already rendered."""
+
+    id: str
+    rendered: str
+    variants: tuple[_PayloadVariant, ...]
+
+
+def _render_payload_template(template: str, variables: dict[str, str], what: str) -> str:
+    """Substitute ${name} placeholders exactly once.
+
+    Variable values are inserted verbatim and never re-scanned, so a value
+    containing placeholders is not expanded. A missing reference, an unused
+    variable, or a malformed placeholder makes the request invalid.
+    """
+    parts: list[str] = []
+    referenced: set[str] = set()
+    index = 0
+    length = len(template)
+    while index < length:
+        if template[index] == "$" and index + 1 < length and template[index + 1] == "{":
+            end = template.find("}", index + 2)
+            if end == -1:
+                raise ValueError(f"{what}.template has a malformed placeholder")
+            name = template[index + 2 : end]
+            if not _VARIABLE_NAME_RE.fullmatch(name) or name not in variables:
+                raise ValueError(
+                    f"{what}.template has a malformed or unresolved placeholder"
+                )
+            parts.append(variables[name])
+            referenced.add(name)
+            index = end + 1
+        else:
+            parts.append(template[index])
+            index += 1
+    unused = set(variables) - referenced
+    if unused:
+        raise ValueError(f"{what}.variables has unused variable: {sorted(unused)[0]!r}")
+    return "".join(parts)
+
+
+def _parse_payload_variant(raw: object, what: str) -> _PayloadVariant:
+    obj = _require_fields(raw, _PAYLOAD_VARIANT_FIELDS, what)
+    variant_id = _non_empty_str(obj["id"], f"{what}.id")
+    raw_steps = obj["steps"]
+    if not isinstance(raw_steps, list):
+        raise ValueError(f"{what}.steps must be an array")
+    steps: list[str] = []
+    for step in raw_steps:
+        if step not in PAYLOAD_STEPS:
+            raise ValueError(f"{what}.steps has an unknown step: {step!r}")
+        steps.append(step)
+    return _PayloadVariant(variant_id, tuple(steps))
+
+
+def _parse_payload_item(raw: object, index: int) -> _PayloadItem:
+    what = f"items[{index}]"
+    obj = _require_fields(raw, _PAYLOAD_ITEM_FIELDS, what)
+    item_id = _non_empty_str(obj["id"], f"{what}.id")
+    template = _non_empty_str(obj["template"], f"{what}.template")
+    raw_variables = obj["variables"]
+    if not isinstance(raw_variables, dict):
+        raise ValueError(f"{what}.variables must be an object")
+    variables: dict[str, str] = {}
+    for name, value in raw_variables.items():
+        if not isinstance(name, str) or not _VARIABLE_NAME_RE.fullmatch(name):
+            raise ValueError(f"{what}.variables has invalid variable name: {name!r}")
+        if not isinstance(value, str):
+            raise ValueError(f"{what}.variables must map names to strings")
+        variables[name] = value
+    raw_variants = obj["variants"]
+    if not isinstance(raw_variants, list):
+        raise ValueError(f"{what}.variants must be an array")
+    variants = [
+        _parse_payload_variant(raw_variant, f"{what}.variants[{i}]")
+        for i, raw_variant in enumerate(raw_variants)
+    ]
+    seen_variant_ids: set[str] = set()
+    for variant in variants:
+        if variant.id in seen_variant_ids:
+            raise ValueError(f"{what} has duplicate variant id: {variant.id!r}")
+        seen_variant_ids.add(variant.id)
+    rendered = _render_payload_template(template, variables, what)
+    return _PayloadItem(item_id, rendered, tuple(variants))
+
+
+def _url_percent_encode(text: str) -> str:
+    """Percent-encode UTF-8 bytes, keeping the RFC 3986 unreserved set."""
+    pieces: list[str] = []
+    for char in text:
+        if char in _PERCENT_SAFE:
+            pieces.append(char)
+        else:
+            pieces.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+    return "".join(pieces)
+
+
+def _base64_encode(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _hex_encode(text: str) -> str:
+    return "".join(f"{byte:02x}" for byte in text.encode("utf-8"))
+
+
+_PAYLOAD_TRANSFORMS = {
+    "url_percent": _url_percent_encode,
+    "base64": _base64_encode,
+    "hex": _hex_encode,
+}
 
 
 class Service:
@@ -1916,3 +2047,58 @@ class Service:
             if item in seen:
                 raise ValueError(f"duplicate {what} id: {item!r}")
             seen.add(item)
+
+    def generate_payloads(self, payload: object) -> dict[str, Any]:
+        """Generate deterministic, offline encoding variants of templates.
+
+        Pure, local evaluation: no network access, no payload execution, no
+        persistent state. All structure is validated first (including
+        duplicate ids and template/variable errors); only then is the single
+        target checked against the allow/deny scope. Raises ValueError on
+        malformed input and ScopeViolationError when the target is out of
+        scope; never returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "target", "items"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+        target = _parse_entry(payload["target"], allow_wildcard=False)
+
+        raw_items = payload["items"]
+        if not isinstance(raw_items, list):
+            raise ValueError("field items must be an array")
+        items = [_parse_payload_item(raw, i) for i, raw in enumerate(raw_items)]
+        self._require_unique_ids((item.id for item in items), "item")
+
+        # Scope gate runs only after the whole request is structurally valid;
+        # even an empty items list must have its target authorized.
+        allowed, reason, _ = self._evaluate(target, allow_rules, deny_rules)
+        if not allowed:
+            raise ScopeViolationError(
+                f"target {target.text} out of scope: {reason}"
+            )
+
+        generated: list[dict[str, Any]] = []
+        for item in items:
+            for variant in item.variants:
+                value = item.rendered
+                for step in variant.steps:
+                    value = _PAYLOAD_TRANSFORMS[step](value)
+                generated.append(
+                    {
+                        "item_id": item.id,
+                        "variant_id": variant.id,
+                        "target": target.text,
+                        "steps": list(variant.steps),
+                        "value": value,
+                    }
+                )
+        return {"generated": generated}
