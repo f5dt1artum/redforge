@@ -21,6 +21,12 @@ LOGICS = ("all", "any")
 OPERATORS = ("equals", "contains", "regex")
 
 _OBSERVATION_FIELDS = frozenset({"id", "target", "status", "headers", "body"})
+_PORT_OBSERVATION_FIELDS = frozenset(
+    {"id", "target", "port", "transport", "banner"}
+)
+_FINGERPRINT_FIELDS = frozenset(
+    {"id", "name", "service", "priority", "logic", "matchers"}
+)
 _TEMPLATE_FIELDS = frozenset({"id", "name", "severity", "logic", "matchers"})
 _FINDING_FIELDS = frozenset(
     {"observation_id", "target", "template_id", "name", "severity", "evidence"}
@@ -300,6 +306,130 @@ def _parse_observation(raw: object, index: int) -> _Observation:
     if not isinstance(body, str):
         raise ValueError(f"{what}.body must be a string")
     return _Observation(observation_id, target, status, dict(headers), body)
+
+
+@dataclass(frozen=True)
+class _PortObservation:
+    """A validated port observation.
+
+    target is the parsed scope entry; its text attribute is the normalized
+    form reported back in assets.
+    """
+
+    id: str
+    target: _Entry
+    port: int
+    transport: str
+    banner: str
+
+
+@dataclass(frozen=True)
+class _PortMatcher:
+    """A validated service-fingerprint matcher.
+
+    kind is one of "ports", "transport", "banner". For ports matchers value
+    is a tuple of distinct valid ports in input order; for transport matchers
+    value is "tcp" or "udp"; for banner matchers value is the non-empty
+    comparison string and regex holds the compiled pattern for "regex".
+    """
+
+    kind: str
+    operator: str | None
+    value: Any
+    regex: Any = None
+
+
+@dataclass(frozen=True)
+class _Fingerprint:
+    id: str
+    name: str
+    service: str
+    priority: int
+    logic: str
+    matchers: tuple[_PortMatcher, ...]
+
+
+def _parse_port_matcher(raw: object, what: str) -> _PortMatcher:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{what} must be an object")
+    keys = set(raw)
+    if keys == {"ports"}:
+        ports = raw["ports"]
+        if not isinstance(ports, list) or not ports:
+            raise ValueError(f"{what}.ports must be a non-empty array")
+        seen: set[int] = set()
+        parsed_ports: list[int] = []
+        for item in ports:
+            if not _is_int(item) or not 1 <= item <= 65535:
+                raise ValueError(
+                    f"{what}.ports must contain only integers between 1 and 65535"
+                )
+            if item in seen:
+                raise ValueError(f"{what}.ports has duplicate port: {item}")
+            seen.add(item)
+            parsed_ports.append(item)
+        return _PortMatcher("ports", None, tuple(parsed_ports))
+    if keys == {"transport"}:
+        transport = raw["transport"]
+        if transport not in ("tcp", "udp"):
+            raise ValueError(f"{what}.transport must be 'tcp' or 'udp'")
+        return _PortMatcher("transport", None, transport)
+    if keys == {"operator", "value"}:
+        operator = raw["operator"]
+        if operator not in OPERATORS:
+            raise ValueError(f"{what}.operator must be one of {OPERATORS}")
+        value = raw["value"]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{what}.value must be a non-empty string")
+        regex = None
+        if operator == "regex":
+            try:
+                regex = re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"{what}.value is an invalid regex: {exc}") from exc
+        return _PortMatcher("banner", operator, value, regex)
+    raise ValueError(f"{what} has unknown or missing fields")
+
+
+def _parse_fingerprint(raw: object, index: int) -> _Fingerprint:
+    what = f"fingerprints[{index}]"
+    obj = _require_fields(raw, _FINGERPRINT_FIELDS, what)
+    fingerprint_id = _non_empty_str(obj["id"], f"{what}.id")
+    name = _non_empty_str(obj["name"], f"{what}.name")
+    service = _non_empty_str(obj["service"], f"{what}.service")
+    priority = obj["priority"]
+    if not _is_int(priority):
+        raise ValueError(f"{what}.priority must be an integer")
+    logic = obj["logic"]
+    if logic not in LOGICS:
+        raise ValueError(f"{what}.logic must be one of {LOGICS}")
+    matchers = obj["matchers"]
+    if not isinstance(matchers, list) or not matchers:
+        raise ValueError(f"{what}.matchers must be a non-empty array")
+    parsed_matchers = tuple(
+        _parse_port_matcher(item, f"{what}.matchers[{i}]")
+        for i, item in enumerate(matchers)
+    )
+    return _Fingerprint(
+        fingerprint_id, name, service, priority, logic, parsed_matchers
+    )
+
+
+def _parse_port_observation(raw: object, index: int) -> _PortObservation:
+    what = f"observations[{index}]"
+    obj = _require_fields(raw, _PORT_OBSERVATION_FIELDS, what)
+    observation_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    port = obj["port"]
+    if not _is_int(port) or not 1 <= port <= 65535:
+        raise ValueError(f"{what}.port must be an integer between 1 and 65535")
+    transport = obj["transport"]
+    if transport not in ("tcp", "udp"):
+        raise ValueError(f"{what}.transport must be 'tcp' or 'udp'")
+    banner = obj["banner"]
+    if not isinstance(banner, str):
+        raise ValueError(f"{what}.banner must be a string")
+    return _PortObservation(observation_id, target, port, transport, banner)
 
 
 @dataclass(frozen=True)
@@ -630,6 +760,14 @@ def _matcher_hit(matcher: _Matcher, observation: _Observation) -> bool:
     return _apply_operator(matcher, observation.body)
 
 
+def _port_matcher_hit(matcher: _PortMatcher, observation: _PortObservation) -> bool:
+    if matcher.kind == "ports":
+        return observation.port in matcher.value
+    if matcher.kind == "transport":
+        return observation.transport == matcher.value
+    return _apply_operator(matcher, observation.banner)
+
+
 class Service:
     """Health, authorization-scope evaluation, and offline template matching."""
 
@@ -809,6 +947,132 @@ class Service:
                         }
                     )
         return {"findings": findings}
+
+    def fingerprint_assets(self, payload: object) -> dict[str, Any]:
+        """Identify local port observations as service assets.
+
+        Pure, local evaluation: no network access, no persistent state. All
+        structure is validated first (including duplicate ids and duplicate
+        endpoints sharing normalized target, transport, and port); only then
+        are observation targets checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError when any target
+        is out of scope; never returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "fingerprints", "observations"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_fingerprints = payload["fingerprints"]
+        if not isinstance(raw_fingerprints, list):
+            raise ValueError("field fingerprints must be an array")
+        fingerprints = [
+            _parse_fingerprint(raw, i) for i, raw in enumerate(raw_fingerprints)
+        ]
+        self._require_unique_ids(
+            (fingerprint.id for fingerprint in fingerprints), "fingerprint"
+        )
+
+        raw_observations = payload["observations"]
+        if not isinstance(raw_observations, list):
+            raise ValueError("field observations must be an array")
+        observations = [
+            _parse_port_observation(raw, i)
+            for i, raw in enumerate(raw_observations)
+        ]
+        self._require_unique_ids(
+            (observation.id for observation in observations), "observation"
+        )
+        # An endpoint is identified by normalized target, transport, port.
+        seen_endpoints: set[tuple[str, str, int]] = set()
+        for observation in observations:
+            endpoint = (
+                observation.target.text,
+                observation.transport,
+                observation.port,
+            )
+            if endpoint in seen_endpoints:
+                raise ValueError(
+                    "duplicate endpoint: "
+                    f"({endpoint[0]!r}, {endpoint[1]}, {endpoint[2]})"
+                )
+            seen_endpoints.add(endpoint)
+
+        # Scope gate: every observation target must be authorized before any
+        # fingerprinting happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (observation.target for observation in observations),
+            allow_rules,
+            deny_rules,
+        )
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for observation in observations:
+            target = observation.target.text
+            if target not in groups:
+                groups[target] = []
+                order.append(target)
+            groups[target].append(self._identify_service(observation, fingerprints))
+
+        assets = [
+            {"target": target, "services": groups[target]} for target in order
+        ]
+        return {"assets": assets}
+
+    @staticmethod
+    def _identify_service(
+        observation: _PortObservation, fingerprints: list[_Fingerprint]
+    ) -> dict[str, Any]:
+        """Pick the highest-priority matching fingerprint for one endpoint."""
+        best: _Fingerprint | None = None
+        best_evidence: list[int] = []
+        # Input order decides priority ties, so only replace on a strict win.
+        for fingerprint in fingerprints:
+            evidence = [
+                index
+                for index, matcher in enumerate(fingerprint.matchers)
+                if _port_matcher_hit(matcher, observation)
+            ]
+            if fingerprint.logic == "all":
+                hit = len(evidence) == len(fingerprint.matchers)
+            else:
+                hit = bool(evidence)
+            if hit and (best is None or fingerprint.priority > best.priority):
+                best = fingerprint
+                best_evidence = evidence
+        service: dict[str, Any] = {
+            "observation_id": observation.id,
+            "port": observation.port,
+            "transport": observation.transport,
+        }
+        if best is None:
+            service.update(
+                {
+                    "service": "unknown",
+                    "fingerprint_id": None,
+                    "name": None,
+                    "evidence": [],
+                }
+            )
+        else:
+            service.update(
+                {
+                    "service": best.service,
+                    "fingerprint_id": best.id,
+                    "name": best.name,
+                    "evidence": best_evidence,
+                }
+            )
+        return service
 
     def consolidate_findings(self, payload: object) -> dict[str, Any]:
         """Consolidate matched findings collected across multiple scans.

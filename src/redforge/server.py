@@ -11,6 +11,7 @@ from .service import ScopeViolationError, Service
 
 SCOPE_PATH = "/v1/scope/evaluate"
 MATCH_PATH = "/v1/vulnerabilities/match"
+FINGERPRINT_PATH = "/v1/assets/fingerprint"
 CONSOLIDATE_PATH = "/v1/findings/consolidate"
 RETEST_PATH = "/v1/findings/retest"
 PLAN_PATH = "/v1/attack-chains/plan"
@@ -18,6 +19,7 @@ EXPORT_PATH = "/v1/reports/export"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
+    FINGERPRINT_PATH,
     CONSOLIDATE_PATH,
     RETEST_PATH,
     PLAN_PATH,
@@ -72,6 +74,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == MATCH_PATH:
             self._handle_json_post(self.service.match_vulnerabilities)
+            return
+        if self.path == FINGERPRINT_PATH:
+            self._handle_json_post(self.service.fingerprint_assets)
             return
         if self.path == CONSOLIDATE_PATH:
             self._handle_json_post(self.service.consolidate_findings)
