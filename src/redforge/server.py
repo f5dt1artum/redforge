@@ -16,6 +16,7 @@ DISCOVER_PATH = "/v1/assets/discover"
 CONSOLIDATE_PATH = "/v1/findings/consolidate"
 RETEST_PATH = "/v1/findings/retest"
 PLAN_PATH = "/v1/attack-chains/plan"
+REMEDIATIONS_PATH = "/v1/remediations/plan"
 EXPORT_PATH = "/v1/reports/export"
 CREDENTIALS_PATH = "/v1/credentials/analyze"
 PAYLOADS_PATH = "/v1/payloads/generate"
@@ -34,6 +35,7 @@ POST_PATHS = (
     CONSOLIDATE_PATH,
     RETEST_PATH,
     PLAN_PATH,
+    REMEDIATIONS_PATH,
     EXPORT_PATH,
     CREDENTIALS_PATH,
     PAYLOADS_PATH,
@@ -109,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == PLAN_PATH:
             self._handle_json_post(self.service.plan_attack_chains)
+            return
+        if self.path == REMEDIATIONS_PATH:
+            self._handle_json_post(self.service.plan_remediations)
             return
         if self.path == EXPORT_PATH:
             self._handle_json_post(self.service.export_report)
