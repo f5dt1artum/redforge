@@ -523,6 +523,204 @@ class WebSecurityServiceTest(unittest.TestCase):
                     self.service.analyze_web_security(payload)
 
 
+class WebSecurityHeadersTest(unittest.TestCase):
+    def setUp(self):
+        self.service = Service()
+
+    def analyze(self, **overrides):
+        overrides.setdefault("checks", ["security_headers"])
+        return self.service.analyze_web_security(analyze_payload(**overrides))[
+            "findings"
+        ]
+
+    def analyze_one(self, headers, scheme="https"):
+        return self.analyze(
+            observations=[make_observation(scheme=scheme, headers=headers)]
+        )
+
+    def test_https_without_any_security_headers_yields_four_ordered_findings(self):
+        findings = self.analyze_one({})
+        self.assertEqual(
+            [(f["category"], f["severity"]) for f in findings],
+            [
+                ("hsts_missing_or_invalid", "high"),
+                ("csp_missing", "medium"),
+                ("clickjacking_unprotected", "medium"),
+                ("nosniff_missing", "low"),
+            ],
+        )
+        for finding in findings:
+            self.assertEqual(
+                set(finding),
+                {"observation_id", "target", "category", "severity", "cookie_name"},
+            )
+            self.assertEqual(finding["observation_id"], "obs-1")
+            self.assertEqual(finding["target"], "app.example.com")
+            self.assertIsNone(finding["cookie_name"])
+
+    def test_http_skips_hsts_but_runs_the_rest(self):
+        findings = self.analyze_one({}, scheme="http")
+        self.assertEqual(
+            [f["category"] for f in findings],
+            ["csp_missing", "clickjacking_unprotected", "nosniff_missing"],
+        )
+
+    def test_fully_protected_https_yields_no_findings(self):
+        headers = {
+            "Strict-Transport-Security": ["max-age=31536000; includeSubDomains"],
+            "Content-Security-Policy": ["default-src 'self'; frame-ancestors 'none'"],
+            "X-Frame-Options": ["DENY"],
+            "X-Content-Type-Options": ["nosniff"],
+        }
+        self.assertEqual(self.analyze_one(headers), [])
+
+    # --- hsts -----------------------------------------------------------
+
+    def test_hsts_valid_max_age_variants(self):
+        for value in (
+            "max-age=31536000",
+            "MAX-AGE=1",
+            "max-age = 60",
+            "includeSubDomains; max-age=100",
+            "max-age=007",
+        ):
+            with self.subTest(value=value):
+                findings = self.analyze_one({"Strict-Transport-Security": [value]})
+                self.assertNotIn(
+                    "hsts_missing_or_invalid",
+                    [f["category"] for f in findings],
+                )
+
+    def test_hsts_invalid_max_age_variants(self):
+        for value in (
+            "max-age=0",
+            "max-age=",
+            "max-age",
+            "max-age=abc",
+            "max-age=1.5",
+            "max-age=+10",
+            "max-age=-1",
+            "max-age=1e3",
+            "includeSubDomains",
+            "maxage=100",
+        ):
+            with self.subTest(value=value):
+                findings = self.analyze_one({"Strict-Transport-Security": [value]})
+                self.assertIn(
+                    "hsts_missing_or_invalid",
+                    [f["category"] for f in findings],
+                )
+
+    def test_hsts_any_value_of_any_header_instance_counts(self):
+        findings = self.analyze_one(
+            {
+                "strict-transport-security": ["max-age=0"],
+                "Strict-Transport-Security": ["max-age=31536000"],
+            }
+        )
+        self.assertNotIn(
+            "hsts_missing_or_invalid", [f["category"] for f in findings]
+        )
+
+    # --- csp --------------------------------------------------------------
+
+    def test_csp_whitespace_only_value_is_missing(self):
+        findings = self.analyze_one({"Content-Security-Policy": ["   "]})
+        self.assertIn("csp_missing", [f["category"] for f in findings])
+
+    def test_csp_present_suppresses_csp_missing_only(self):
+        findings = self.analyze_one(
+            {"content-security-policy": ["default-src 'self'"]}
+        )
+        categories = [f["category"] for f in findings]
+        self.assertNotIn("csp_missing", categories)
+        # A CSP without frame-ancestors does not protect against clickjacking.
+        self.assertIn("clickjacking_unprotected", categories)
+
+    # --- clickjacking -----------------------------------------------------
+
+    def test_x_frame_options_deny_and_sameorigin_case_insensitive(self):
+        for value in ("DENY", "deny", " SameOrigin ", "SAMEORIGIN"):
+            with self.subTest(value=value):
+                findings = self.analyze_one({"X-Frame-Options": [value]})
+                self.assertNotIn(
+                    "clickjacking_unprotected", [f["category"] for f in findings]
+                )
+
+    def test_x_frame_options_other_values_do_not_protect(self):
+        for value in ("ALLOWALL", "DENIED", "deny sameorigin", ""):
+            with self.subTest(value=value):
+                headers = {"X-Frame-Options": [value]} if value else {}
+                findings = self.analyze_one(headers)
+                self.assertIn(
+                    "clickjacking_unprotected", [f["category"] for f in findings]
+                )
+
+    def test_csp_frame_ancestors_with_parameter_protects(self):
+        findings = self.analyze_one(
+            {
+                "Content-Security-Policy": [
+                    "default-src 'self'; FRAME-ANCESTORS 'none'"
+                ]
+            }
+        )
+        categories = [f["category"] for f in findings]
+        self.assertNotIn("csp_missing", categories)
+        self.assertNotIn("clickjacking_unprotected", categories)
+
+    def test_csp_frame_ancestors_without_parameter_does_not_protect(self):
+        findings = self.analyze_one(
+            {"Content-Security-Policy": ["default-src 'self'; frame-ancestors"]}
+        )
+        self.assertIn("clickjacking_unprotected", [f["category"] for f in findings])
+
+    # --- nosniff ----------------------------------------------------------
+
+    def test_nosniff_case_insensitive_and_trimmed(self):
+        for value in ("nosniff", "NoSniff", "  NOSNIFF  "):
+            with self.subTest(value=value):
+                findings = self.analyze_one({"X-Content-Type-Options": [value]})
+                self.assertNotIn("nosniff_missing", [f["category"] for f in findings])
+
+    def test_nosniff_lookalike_does_not_count(self):
+        findings = self.analyze_one({"X-Content-Type-Options": ["nosniffx"]})
+        self.assertIn("nosniff_missing", [f["category"] for f in findings])
+
+    # --- ordering / integration ------------------------------------------
+
+    def test_security_headers_order_within_mixed_checks(self):
+        headers = {"Set-Cookie": ["session=abc"], **cors_headers()}
+        findings = self.analyze(
+            checks=["security_headers", "cors", "cookie"],
+            observations=[make_observation(headers=headers)],
+        )
+        self.assertEqual(
+            [f["category"] for f in findings],
+            [
+                "hsts_missing_or_invalid",
+                "csp_missing",
+                "clickjacking_unprotected",
+                "nosniff_missing",
+                "cors_wildcard_credentials",
+                "cookie_missing_secure",
+                "cookie_missing_httponly",
+            ],
+        )
+
+    def test_empty_observations(self):
+        self.assertEqual(self.analyze(observations=[]), [])
+
+    def test_duplicate_and_unknown_checks_rejected(self):
+        with self.assertRaises(ValueError):
+            self.analyze(checks=["security_headers", "security_headers"])
+        with self.assertRaises(ValueError):
+            self.analyze(checks=["SECURITY_HEADERS"])
+
+    def test_scope_violation_still_raises(self):
+        with self.assertRaises(ScopeViolationError):
+            self.analyze(observations=[make_observation(target="evil.net")])
+
+
 class WebSecurityHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -581,6 +779,29 @@ class WebSecurityHttpTest(unittest.TestCase):
             ],
         )
         self.assertIsNone(payload["findings"][0]["cookie_name"])
+
+    def test_security_headers_ok(self):
+        status, payload = self.post_analyze(
+            analyze_payload(
+                checks=["security_headers"],
+                observations=[
+                    make_observation(
+                        headers={
+                            "Strict-Transport-Security": ["max-age=31536000"],
+                            "X-Content-Type-Options": ["nosniff"],
+                        }
+                    )
+                ],
+            )
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [(f["category"], f["severity"], f["cookie_name"]) for f in payload["findings"]],
+            [
+                ("csp_missing", "medium", None),
+                ("clickjacking_unprotected", "medium", None),
+            ],
+        )
 
     def test_empty_observations_ok(self):
         status, payload = self.post_analyze(analyze_payload(observations=[]))

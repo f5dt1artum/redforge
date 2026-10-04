@@ -114,7 +114,7 @@ _ZERO_HASH = "0" * 64
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
 # Categories analyzable by the offline web-response security analyzer.
-WEB_SECURITY_CHECKS = ("cors", "cookie")
+WEB_SECURITY_CHECKS = ("cors", "cookie", "security_headers")
 WEB_SCHEMES = ("http", "https")
 
 SAFETY_KINDS = ("discovery", "verification", "exploitation", "credential", "privilege")
@@ -3348,7 +3348,7 @@ class Service:
         }
 
     def analyze_web_security(self, payload: object) -> dict[str, Any]:
-        """Analyze offline HTTP response observations for CORS/cookie issues.
+        """Analyze offline HTTP response observations for web security issues.
 
         Pure, local evaluation: no network access and no persistent state.
         All structure is validated first (including duplicate observation and
@@ -3419,8 +3419,10 @@ class Service:
                                 "cookie_name": None,
                             }
                         )
-                else:
+                elif check == "cookie":
                     findings.extend(self._cookie_findings(observation))
+                else:
+                    findings.extend(self._security_headers_findings(observation))
         return {"findings": findings}
 
     @staticmethod
@@ -3493,3 +3495,73 @@ class Service:
                 for category in categories
             )
         return findings
+
+    @staticmethod
+    def _hsts_max_age_valid(value: str) -> bool:
+        """Whether one Strict-Transport-Security value carries max-age > 0.
+
+        The value is split on semicolons; a max-age directive counts only
+        when the text right of the equals sign is (after trimming) a pure
+        ASCII decimal integer greater than zero. Anything malformed simply
+        does not count.
+        """
+        for directive in value.split(";"):
+            name, separator, parameter = directive.partition("=")
+            if not separator or name.strip().lower() != "max-age":
+                continue
+            digits = parameter.strip()
+            if (
+                digits
+                and all(char in "0123456789" for char in digits)
+                and int(digits) > 0
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _csp_has_frame_ancestors(value: str) -> bool:
+        """Whether one CSP value has a frame-ancestors directive with a
+        non-empty parameter."""
+        for directive in value.split(";"):
+            parts = directive.split()
+            if len(parts) > 1 and parts[0].lower() == "frame-ancestors":
+                return True
+        return False
+
+    @classmethod
+    def _security_headers_findings(
+        cls, observation: _WebObservation
+    ) -> list[dict[str, Any]]:
+        """Transport/CSP/clickjacking/nosniff findings in that fixed order."""
+        headers = observation.headers
+        categories: list[tuple[str, str]] = []
+        # HSTS is only meaningful on HTTPS responses; http skips it entirely.
+        if observation.scheme == "https" and not any(
+            cls._hsts_max_age_valid(value)
+            for value in cls._header_values_ci(headers, "strict-transport-security")
+        ):
+            categories.append(("hsts_missing_or_invalid", "high"))
+        csp_values = cls._header_values_ci(headers, "content-security-policy")
+        if not any(value.strip() for value in csp_values):
+            categories.append(("csp_missing", "medium"))
+        clickjacking_protected = any(
+            value.strip().lower() in ("deny", "sameorigin")
+            for value in cls._header_values_ci(headers, "x-frame-options")
+        ) or any(cls._csp_has_frame_ancestors(value) for value in csp_values)
+        if not clickjacking_protected:
+            categories.append(("clickjacking_unprotected", "medium"))
+        if not any(
+            value.strip().lower() == "nosniff"
+            for value in cls._header_values_ci(headers, "x-content-type-options")
+        ):
+            categories.append(("nosniff_missing", "low"))
+        return [
+            {
+                "observation_id": observation.id,
+                "target": observation.target.text,
+                "category": category,
+                "severity": severity,
+                "cookie_name": None,
+            }
+            for category, severity in categories
+        ]
