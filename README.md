@@ -83,6 +83,23 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `missing_requirements`，条件成立但依赖未就绪时原因为 `dependency_blocked`。成功响应仅含 `plans`，
   每项含 `target` 和覆盖所有阶段的 `stages`（阶段结果含 `id`、`name`、`status`、`reason`）；空
   `findings` 返回空 `plans`，相同输入的数组顺序稳定。
+- `POST /v1/remediations/plan`：把 consolidate 同形的 findings 与修复目录生成分目标修复计划，纯本地处理，
+  不联网、不执行修复、不持久化。请求体仅含 `allow`、`deny`、`findings`、`remediations`；
+  `findings` 与 consolidate 响应的 `consolidated` 数组同形且可为空，`remediations` 可为空数组。
+  每个修复项仅含唯一非空 `id`、非空 `title` 与 `guidance`、1–100 的非布尔整数 `priority`、非空且
+  无重复的 `template_ids`（非空字符串数组）和无重复的 `depends_on`（修复 id 字符串数组）。先完成全部
+  结构校验（结构、类型错误，规范化 `target` 与区分大小写 `template_id` 组合的 finding 键重复，修复
+  `id` 重复，依赖引用未知 id、自指或成环均返回 400 `invalid_request`），再按既有 allow/deny 语义检查
+  全部 finding 的规范化 `target`，任一越界则整体返回 403 `scope_violation`，不返回局部计划；空
+  `findings` 仍校验目录与范围规则。修复项仅当 `template_ids` 命中某目标下的 finding 时才进入该目标计划，
+  不补造未命中的依赖：某直接依赖未进入该目标时为 `blocked`/`dependency_not_applicable`；已进入的依赖中
+  含 blocked 时为 `blocked`/`dependency_blocked`；否则为 `ready`/`null`。成功响应仅含 `plans` 与
+  `summary`：plans 按目标首次出现排序，每项含 `target`、`actions`、`uncovered_template_ids`；actions
+  按目录的稳定拓扑序排列（同层以 `priority` 降序、再按目录输入序决胜），每项仅含 `remediation_id`、
+  `title`、`guidance`、`status`、`reason`、`matched_template_ids`（按该目标 finding 首次出现序去重）；
+  `uncovered_template_ids` 按 finding 顺序去重列出没有任何修复项覆盖的模板。summary 仅含
+  `targets`、`actions`、`ready`、`blocked`、`uncovered_findings` 五个整数。空 `findings` 返回空
+  `plans` 与全零 summary；空 `remediations` 合法且所有 finding 均未覆盖；相同输入始终产生相同结果。
 - `POST /v1/reports/export`：把既有结果导出为单一稳定的证据报告，纯本地处理。请求体仅含 `allow`、`deny`、
   `title`、`findings`、`comparisons`、`plans`；`title` 为非空字符串，后三项分别沿用 consolidate、retest 和
   attack-chains/plan 的结果项，均为可空数组。先完成结构及交叉一致性校验：以规范化 `target` 与区分大小写的

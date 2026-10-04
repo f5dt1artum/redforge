@@ -65,6 +65,9 @@ _COMPARISON_FIELDS = frozenset(
 )
 _PLAN_FIELDS = frozenset({"target", "stages"})
 _STAGE_RESULT_FIELDS = frozenset({"id", "name", "status", "reason"})
+_REMEDIATION_FIELDS = frozenset(
+    {"id", "title", "guidance", "priority", "template_ids", "depends_on"}
+)
 _POLICY_FIELDS = frozenset({"min_length", "weak_secrets"})
 _CREDENTIAL_ATTEMPT_FIELDS = frozenset(
     {
@@ -908,6 +911,68 @@ def _parse_stage(raw: object, index: int, seen_ids: set[str]) -> _Stage:
         seen_deps.add(dep)
         deps.append(dep)
     return _Stage(stage_id, name, logic, parsed_requires, tuple(deps))
+
+
+@dataclass(frozen=True)
+class _Remediation:
+    """A validated remediation catalog entry.
+
+    template_ids and depends_on are kept in input order with duplicates
+    rejected; dependencies reference other remediation ids.
+    """
+
+    id: str
+    title: str
+    guidance: str
+    priority: int
+    template_ids: tuple[str, ...]
+    depends_on: tuple[str, ...]
+
+
+def _parse_remediation(raw: object, index: int) -> _Remediation:
+    what = f"remediations[{index}]"
+    obj = _require_fields(raw, _REMEDIATION_FIELDS, what)
+    remediation_id = _non_empty_str(obj["id"], f"{what}.id")
+    title = _non_empty_str(obj["title"], f"{what}.title")
+    guidance = _non_empty_str(obj["guidance"], f"{what}.guidance")
+    priority = obj["priority"]
+    if not _is_int(priority) or not 1 <= priority <= 100:
+        raise ValueError(f"{what}.priority must be an integer between 1 and 100")
+    raw_template_ids = obj["template_ids"]
+    if not isinstance(raw_template_ids, list) or not raw_template_ids:
+        raise ValueError(f"{what}.template_ids must be a non-empty array")
+    template_ids: list[str] = []
+    seen_templates: set[str] = set()
+    for template_id in raw_template_ids:
+        _non_empty_str(template_id, f"{what}.template_ids[]")
+        if template_id in seen_templates:
+            raise ValueError(
+                f"{what}.template_ids has duplicate entry: {template_id!r}"
+            )
+        seen_templates.add(template_id)
+        template_ids.append(template_id)
+    raw_depends_on = obj["depends_on"]
+    if not isinstance(raw_depends_on, list):
+        raise ValueError(f"{what}.depends_on must be an array")
+    depends_on: list[str] = []
+    seen_deps: set[str] = set()
+    for dep in raw_depends_on:
+        if not isinstance(dep, str) or not dep:
+            raise ValueError(
+                f"{what}.depends_on must contain only non-empty strings"
+            )
+        if dep in seen_deps:
+            raise ValueError(f"{what}.depends_on has duplicate entry: {dep!r}")
+        seen_deps.add(dep)
+        depends_on.append(dep)
+    return _Remediation(
+        remediation_id,
+        title,
+        guidance,
+        priority,
+        tuple(template_ids),
+        tuple(depends_on),
+    )
 
 
 def _apply_operator(matcher: _Matcher, text: str) -> bool:
@@ -2373,6 +2438,256 @@ class Service:
                 }
             )
         return results
+
+    def plan_remediations(self, payload: object) -> dict[str, Any]:
+        """Build per-target remediation plans from consolidated findings.
+
+        Pure, local evaluation: no network access, no remediation execution,
+        no persistent state. The findings carry the same shape as a
+        consolidate response's ``consolidated`` array and may be empty; the
+        remediation catalog may be empty as well. All structure is validated
+        first (including duplicate finding keys, duplicate remediation ids,
+        and unknown, self, duplicate, or cyclic dependencies); only then is
+        every finding target checked against the allow/deny scope. Raises
+        ValueError on malformed input and ScopeViolationError for any
+        out-of-scope target; never returns partial plans.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "findings", "remediations"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_findings = payload["findings"]
+        if not isinstance(raw_findings, list):
+            raise ValueError("field findings must be an array")
+        findings = [
+            _parse_consolidated_item(raw, f"findings[{i}]")
+            for i, raw in enumerate(raw_findings)
+        ]
+
+        raw_remediations = payload["remediations"]
+        if not isinstance(raw_remediations, list):
+            raise ValueError("field remediations must be an array")
+        remediations = [
+            _parse_remediation(raw, i) for i, raw in enumerate(raw_remediations)
+        ]
+        self._require_unique_ids(
+            (remediation.id for remediation in remediations), "remediation"
+        )
+
+        # Structural validation must finish before the scope gate, so a
+        # duplicate finding key or a broken dependency graph is a 400 even
+        # when a target is out of scope.
+        seen_keys: set[tuple[str, str]] = set()
+        for item in findings:
+            key = (item.target.text, item.template_id)
+            if key in seen_keys:
+                raise ValueError(
+                    f"duplicate finding key: ({key[0]!r}, {key[1]!r})"
+                )
+            seen_keys.add(key)
+        ordered_remediations = self._resolve_remediation_order(remediations)
+
+        # Then gate every finding target; a single rejection voids the plan.
+        self._assert_targets_in_scope(
+            (item.target for item in findings), allow_rules, deny_rules
+        )
+
+        # Group findings by normalized target, keeping first-occurrence order.
+        groups: dict[str, list[_ConsolidatedItem]] = {}
+        for item in findings:
+            groups.setdefault(item.target.text, []).append(item)
+
+        input_positions = {
+            remediation.id: i for i, remediation in enumerate(remediations)
+        }
+        plans: list[dict[str, Any]] = []
+        total_actions = 0
+        total_ready = 0
+        total_blocked = 0
+        total_uncovered = 0
+        for target, target_findings in groups.items():
+            actions, uncovered = self._build_remediation_plan(
+                target,
+                target_findings,
+                ordered_remediations,
+                input_positions,
+            )
+            plans.append(
+                {
+                    "target": target,
+                    "actions": actions,
+                    "uncovered_template_ids": uncovered,
+                }
+            )
+            total_actions += len(actions)
+            total_ready += sum(1 for action in actions if action["status"] == "ready")
+            total_blocked += sum(
+                1 for action in actions if action["status"] == "blocked"
+            )
+            total_uncovered += len(uncovered)
+        return {
+            "plans": plans,
+            "summary": {
+                "targets": len(plans),
+                "actions": total_actions,
+                "ready": total_ready,
+                "blocked": total_blocked,
+                "uncovered_findings": total_uncovered,
+            },
+        }
+
+    @staticmethod
+    def _resolve_remediation_order(
+        remediations: list[_Remediation],
+    ) -> list[_Remediation]:
+        """Stable topological order: same level keeps catalog input order.
+
+        Raises ValueError on self-references, unknown ids, or cycles.
+        """
+        known = {remediation.id for remediation in remediations}
+        for remediation in remediations:
+            for dep in remediation.depends_on:
+                if dep == remediation.id:
+                    raise ValueError(
+                        f"remediation {remediation.id!r} depends on itself"
+                    )
+                if dep not in known:
+                    raise ValueError(
+                        f"remediation {remediation.id!r} depends on unknown id: "
+                        f"{dep!r}"
+                    )
+        remaining = list(remediations)
+        done: set[str] = set()
+        ordered: list[_Remediation] = []
+        while remaining:
+            ready_now = [
+                remediation
+                for remediation in remaining
+                if all(dep in done for dep in remediation.depends_on)
+            ]
+            if not ready_now:
+                raise ValueError("remediation dependencies form a cycle")
+            for remediation in ready_now:
+                done.add(remediation.id)
+            ordered.extend(ready_now)
+            remaining = [
+                remediation
+                for remediation in remaining
+                if remediation.id not in done
+            ]
+        return ordered
+
+    @staticmethod
+    def _build_remediation_plan(
+        target: str,
+        target_findings: list[_ConsolidatedItem],
+        ordered_remediations: list[_Remediation],
+        input_positions: dict[str, int],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Evaluate the catalog against one target's findings.
+
+        Only remediations matching at least one of this target's findings
+        enter the plan. A direct dependency that does not enter is
+        blocked/dependency_not_applicable; an entered but blocked dependency
+        is blocked/dependency_blocked; otherwise the action is ready/null.
+        Entered actions keep the catalog's stable topological order, with
+        priority descending and catalog input order deciding ties.
+        """
+        # Finding template ids in first-occurrence order, case-sensitive.
+        finding_templates: list[str] = []
+        finding_template_set: set[str] = set()
+        for item in target_findings:
+            if item.template_id not in finding_template_set:
+                finding_template_set.add(item.template_id)
+                finding_templates.append(item.template_id)
+
+        catalog_sets = {
+            remediation.id: set(remediation.template_ids)
+            for remediation in ordered_remediations
+        }
+        entered: dict[str, _Remediation] = {}
+        matched_by_id: dict[str, list[str]] = {}
+        for remediation in ordered_remediations:
+            catalog_set = catalog_sets[remediation.id]
+            matches = [
+                template_id
+                for template_id in finding_templates
+                if template_id in catalog_set
+            ]
+            if matches:
+                entered[remediation.id] = remediation
+                matched_by_id[remediation.id] = matches
+
+        statuses: dict[str, str] = {}
+        reasons: dict[str, str | None] = {}
+        for remediation in ordered_remediations:
+            if remediation.id not in entered:
+                continue
+            not_applicable = [
+                dep for dep in remediation.depends_on if dep not in entered
+            ]
+            if not_applicable:
+                status, reason = "blocked", "dependency_not_applicable"
+            elif any(statuses[dep] == "blocked" for dep in remediation.depends_on):
+                status, reason = "blocked", "dependency_blocked"
+            else:
+                status, reason = "ready", None
+            statuses[remediation.id] = status
+            reasons[remediation.id] = reason
+
+        # Catalog DAG levels (longest dependency chain) decide the topological
+        # layer; within a layer priority descends, then catalog input order.
+        level: dict[str, int] = {}
+        for remediation in ordered_remediations:
+            if remediation.depends_on:
+                level[remediation.id] = (
+                    max(level[dep] for dep in remediation.depends_on) + 1
+                )
+            else:
+                level[remediation.id] = 0
+        ordered_entered = [
+            remediation
+            for remediation in ordered_remediations
+            if remediation.id in entered
+        ]
+        ordered_entered.sort(
+            key=lambda remediation: (
+                level[remediation.id],
+                -remediation.priority,
+                input_positions[remediation.id],
+            )
+        )
+
+        actions = [
+            {
+                "remediation_id": remediation.id,
+                "title": remediation.title,
+                "guidance": remediation.guidance,
+                "status": statuses[remediation.id],
+                "reason": reasons[remediation.id],
+                "matched_template_ids": matched_by_id[remediation.id],
+            }
+            for remediation in ordered_entered
+        ]
+
+        covered: set[str] = set()
+        for matches in matched_by_id.values():
+            covered.update(matches)
+        uncovered = [
+            template_id
+            for template_id in finding_templates
+            if template_id not in covered
+        ]
+        return actions, uncovered
 
     def export_report(self, payload: object) -> dict[str, Any]:
         """Export existing results as one stable, local evidence report.
