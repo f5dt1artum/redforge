@@ -253,6 +253,21 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `observation_id`、规范化 `target`、`category`（即上述 finding 代码）、`severity`、
   `cookie_name`（cors 与 security_headers 为 `null`，cookie 类取首个等号前原文，不回显完整 Cookie）。空 `observations`
   或无命中返回空 `findings`，相同输入始终产生相同结果。
+- `POST /v1/web/redirect-analyze`：离线分析重定向响应观测中的开放重定向，不联网、不执行载荷、不持久化。
+  请求体仅含 `allow`、`deny`、`observations`；`observations` 可为空数组，每项仅含唯一非空 `id`、沿用既有
+  目标语法且不得为通配符的 `target`、`scheme`（仅 `http` 或 `https`）、以 `/` 开头且不含片段的
+  `request_path`、100–599 的非布尔整数 `status`、字符串或 `null` 的 `location`，以及绝对 http/https
+  URL 形式且不含用户信息或片段的 `canary_url`。先完成全部结构校验（字段缺失或多余、类型或值非法、重复
+  `id`、非法范围规则均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个观测的规范化
+  `target`，任一越界则整体返回 403 `scope_violation`，不返回局部结果。仅当 `status` 为
+  301/302/303/307/308 且 `location` 非空时判定：`location` 按标准相对 URL 规则，以 `scheme`、规范化
+  `target` 与 `request_path` 组成的请求 URL 为基准解析；结果不是绝对 http/https URL 时不命中。
+  协议与主机名比较不区分大小写，省略端口与默认端口等价，路径与查询字符串区分大小写；只有解析目标与
+  `canary_url` 按这些规则完全相同且与原请求不同源时，才产生 `category` 为 `open_redirect`、`severity`
+  为 `high` 的发现。`location` 的畸形转义、非 HTTP 协议或无法形成有效绝对地址只使该观测不命中，不导致
+  请求失败。成功响应仅含 `findings`，按 observations 输入顺序排列，每项仅含 `observation_id`、规范化
+  `target`、`category`、`severity` 和规范化 `destination`；未命中或空 `observations` 返回空
+  `findings`，相同输入的内容和顺序始终稳定。
 
 ## 验证
 

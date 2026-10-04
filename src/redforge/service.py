@@ -16,6 +16,7 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from . import __version__
 
@@ -100,6 +101,9 @@ _SAFETY_ACTION_FIELDS = frozenset({"id", "target", "kind", "scheduled_ms"})
 _AUDIT_EVENT_FIELDS = frozenset({"id", "target", "kind", "outcome", "occurred_ms"})
 _AUDIT_FIELDS = frozenset({"exercise_id", "records", "head_hash"})
 _WEB_OBSERVATION_FIELDS = frozenset({"id", "target", "scheme", "headers"})
+_REDIRECT_OBSERVATION_FIELDS = frozenset(
+    {"id", "target", "scheme", "request_path", "status", "location", "canary_url"}
+)
 _DISCOVER_RECORD_FIELDS = frozenset({"id", "name", "type", "value"})
 _AUDIT_RECORD_FIELDS = frozenset(
     {
@@ -121,6 +125,12 @@ RATE_LIMIT_GROUPINGS = ("target", "target_route")
 # Categories analyzable by the offline web-response security analyzer.
 WEB_SECURITY_CHECKS = ("cors", "cookie", "security_headers")
 WEB_SCHEMES = ("http", "https")
+
+# Redirect statuses evaluated by the offline open-redirect analyzer.
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+OPEN_REDIRECT_CATEGORY = "open_redirect"
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_MALFORMED_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 # DNS record types accepted by the offline asset-discovery endpoint.
 DISCOVER_RECORD_TYPES = ("A", "AAAA", "CNAME")
@@ -1440,6 +1450,178 @@ def _parse_discover_record(raw: object, index: int) -> _DnsRecord:
     elif value_entry.kind != "host":
         raise ValueError(f"{what}.value must be a hostname")
     return _DnsRecord(record_id, name.text, record_type, value_entry)
+
+
+@dataclass(frozen=True)
+class _ParsedUrl:
+    """An absolute http/https URL in normalized comparison form.
+
+    scheme is lowercase; host is the normalized hostname or IP literal; port
+    is the explicit port or None when absent (default ports compare equal to
+    absent ones); path is never empty ("" becomes "/"); query is verbatim.
+    Fragments and userinfo play no role in this form.
+    """
+
+    scheme: str
+    host: str
+    port: int | None
+    path: str
+    query: str
+
+
+def _normalize_url_host(host: str) -> str:
+    """Normalized comparison form of a URL host: IP literal or hostname."""
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    return _normalize_hostname(host)
+
+
+def _split_http_url(parts: Any) -> _ParsedUrl | None:
+    """Normalized form of a urlsplit result, or None when it is not an
+    absolute http/https URL with a valid host and port."""
+    if parts.scheme not in WEB_SCHEMES:
+        return None
+    host = parts.hostname
+    if not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    try:
+        normalized_host = _normalize_url_host(host)
+    except ValueError:
+        return None
+    return _ParsedUrl(parts.scheme, normalized_host, port, parts.path or "/", parts.query)
+
+
+def _parse_canary_url(raw: object, what: str) -> _ParsedUrl:
+    """Validate a canary URL: absolute http/https, no userinfo or fragment."""
+    value = raw
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{what}.canary_url must be a non-empty string")
+    if "#" in value:
+        raise ValueError(f"{what}.canary_url must not contain a fragment")
+    try:
+        parts = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(f"{what}.canary_url is not a valid URL") from exc
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{what}.canary_url must not contain userinfo")
+    parsed = _split_http_url(parts)
+    if parsed is None:
+        raise ValueError(
+            f"{what}.canary_url must be an absolute http or https URL"
+        )
+    return parsed
+
+
+@dataclass(frozen=True)
+class _RedirectObservation:
+    """A validated redirect observation.
+
+    target is the parsed scope entry (never a wildcard); its text attribute
+    is the normalized form reported back in findings and used to build the
+    request URL. canary is the normalized canary URL.
+    """
+
+    id: str
+    target: _Entry
+    scheme: str
+    request_path: str
+    status: int
+    location: str | None
+    canary: _ParsedUrl
+
+
+def _parse_redirect_observation(raw: object, index: int) -> _RedirectObservation:
+    what = f"observations[{index}]"
+    obj = _require_fields(raw, _REDIRECT_OBSERVATION_FIELDS, what)
+    observation_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    scheme = obj["scheme"]
+    if scheme not in WEB_SCHEMES:
+        raise ValueError(f"{what}.scheme must be one of {WEB_SCHEMES}")
+    request_path = obj["request_path"]
+    if not isinstance(request_path, str) or not request_path.startswith("/"):
+        raise ValueError(
+            f"{what}.request_path must be a string starting with '/'"
+        )
+    if "#" in request_path:
+        raise ValueError(f"{what}.request_path must not contain a fragment")
+    status = obj["status"]
+    if not _is_int(status) or not 100 <= status <= 599:
+        raise ValueError(f"{what}.status must be an integer between 100 and 599")
+    location = obj["location"]
+    if location is not None and not isinstance(location, str):
+        raise ValueError(f"{what}.location must be a string or null")
+    canary = _parse_canary_url(obj["canary_url"], what)
+    return _RedirectObservation(
+        observation_id, target, scheme, request_path, status, location, canary
+    )
+
+
+def _request_base_url(observation: _RedirectObservation) -> str | None:
+    """The request URL the location resolves against, or None when the
+    target cannot appear in a URL authority (a network range)."""
+    target = observation.target
+    if target.kind == "network":
+        return None
+    host = target.text
+    if target.kind == "ip" and target.value.version == 6:
+        host = f"[{host}]"
+    return f"{observation.scheme}://{host}{observation.request_path}"
+
+
+def _redirect_destination(observation: _RedirectObservation) -> _ParsedUrl | None:
+    """Resolved, normalized redirect target, or None when not applicable.
+
+    Only redirect statuses with a non-empty location are evaluated. A
+    location with malformed percent escapes, a non-http(s) scheme, userinfo,
+    or one that cannot form a valid absolute address simply does not hit.
+    """
+    if observation.status not in REDIRECT_STATUSES:
+        return None
+    location = observation.location
+    if not location:
+        return None
+    if _MALFORMED_PERCENT_RE.search(location):
+        return None
+    base = _request_base_url(observation)
+    if base is None:
+        return None
+    try:
+        parts = urlsplit(urljoin(base, location))
+    except ValueError:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return _split_http_url(parts)
+
+
+def _url_origin(url: _ParsedUrl) -> tuple[str, str, int]:
+    port = url.port if url.port is not None else _DEFAULT_PORTS[url.scheme]
+    return (url.scheme, url.host, port)
+
+
+def _url_key(url: _ParsedUrl) -> tuple[str, str, int, str, str]:
+    scheme, host, port = _url_origin(url)
+    return (scheme, host, port, url.path, url.query)
+
+
+def _format_url(url: _ParsedUrl) -> str:
+    """Canonical text form: lowercase scheme/host, default port omitted."""
+    host = url.host
+    if ":" in host:
+        host = f"[{host}]"
+    if url.port is not None and url.port != _DEFAULT_PORTS[url.scheme]:
+        host = f"{host}:{url.port}"
+    text = f"{url.scheme}://{host}{url.path}"
+    if url.query:
+        text += "?" + url.query
+    return text
 
 
 def _url_percent_encode(text: str) -> str:
@@ -4085,3 +4267,76 @@ class Service:
                 headers, "x-content-type-options"
             )
         )
+
+    def analyze_redirects(self, payload: object) -> dict[str, Any]:
+        """Analyze offline redirect observations for open redirects.
+
+        Pure, local evaluation: no network access, no payload execution, no
+        persistent state. All structure is validated first (fields, scope
+        rules, duplicate observation ids); only then are observation targets
+        checked against the allow/deny scope. Raises ValueError on malformed
+        input and ScopeViolationError when any target is out of scope; never
+        returns partial results. A finding is produced only when a redirect
+        status with a non-empty location resolves, against the request URL
+        built from scheme, normalized target and request_path, to an
+        absolute http/https URL identical to the canary URL (scheme and
+        hostname case-insensitive, default ports equivalent, path and query
+        case-sensitive) and cross-origin to the original request. The same
+        input always produces the same findings in the same order.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "observations"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_observations = payload["observations"]
+        if not isinstance(raw_observations, list):
+            raise ValueError("field observations must be an array")
+        observations = [
+            _parse_redirect_observation(raw, i)
+            for i, raw in enumerate(raw_observations)
+        ]
+        self._require_unique_ids(
+            (observation.id for observation in observations), "observation"
+        )
+
+        # Scope gate: every observation target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (observation.target for observation in observations),
+            allow_rules,
+            deny_rules,
+        )
+
+        findings: list[dict[str, Any]] = []
+        for observation in observations:
+            destination = _redirect_destination(observation)
+            if destination is None:
+                continue
+            if _url_key(destination) != _url_key(observation.canary):
+                continue
+            request_origin = (
+                observation.scheme,
+                observation.target.text,
+                _DEFAULT_PORTS[observation.scheme],
+            )
+            if _url_origin(destination) == request_origin:
+                continue
+            findings.append(
+                {
+                    "observation_id": observation.id,
+                    "target": observation.target.text,
+                    "category": OPEN_REDIRECT_CATEGORY,
+                    "severity": "high",
+                    "destination": _format_url(destination),
+                }
+            )
+        return {"findings": findings}
