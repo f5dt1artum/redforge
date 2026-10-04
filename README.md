@@ -34,6 +34,20 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `observation_id`、`port`、`transport`、`service`、`fingerprint_id`、`name`、`evidence`。未命中任何指纹时
   `service` 为 `"unknown"`，`fingerprint_id` 与 `name` 为 `null`，`evidence` 为空数组；空 `observations`
   返回空 `assets`；相同输入内容与顺序产生稳定结果。
+- `POST /v1/assets/discover`：在不联网、不探测、不持久化的前提下，依据离线 DNS 记录把授权种子扩展为确定的
+  主机与地址清单。请求体仅含 `allow`、`deny`、`seeds`、`records`、`max_depth`；`seeds` 是规范化后无重复的
+  目标字符串数组（沿用既有主机名与单个 IP 语法，不接受网络段或通配符），`max_depth` 为 0–32 的非布尔整数。
+  `records` 可为空数组，每项仅含唯一非空 `id`、`name`（主机名）、`type`（仅 `A`、`AAAA`、`CNAME`）和
+  `value`（对应 IPv4、IPv6 或主机名）；主机名与记录名沿用既有 IDNA、小写及末尾点规范。每个种子以深度 0
+  按广度遍历：当前目标为主机名且深度小于 `max_depth` 时按 records 顺序展开同名记录，IP 不展开；资产按规范化
+  形式去重，环不重复，多路径到达同一资产时保留最短路径，等长保留按 seeds 与 records 顺序最先发现的路径。
+  先完成全部结构校验（字段缺失或未知、类型错误、重复标识、规范化后重复种子、非法名称、非法范围规则、类型与
+  地址版本不符均返回 400 `invalid_request`），再仅对深度内实际可达的种子与发现目标执行既有范围判定，任一
+  未授权则整体返回 403 `scope_violation`，不返回局部清单，未遍历的记录值不参与范围判定。成功响应仅含
+  `assets`，按广度优先输出、同层保持首次发现顺序；每项仅含规范化 `target`、`kind`（`hostname` 或 `ip`）、
+  `depth`、`source`、`record_id`，种子的 `source` 与 `record_id` 为 `null`，发现项记录首次路径的直接来源
+  与记录 id。`max_depth` 为 0 时只返回种子，空 `seeds` 返回空 `assets` 但仍校验其余输入，相同输入始终产生
+  相同结果。
 - `POST /v1/findings/consolidate`：汇总多次扫描的匹配结果，纯本地处理。请求体含 `allow`、`deny` 和非空
   `runs`；每个 run 有唯一非空 `id`、0–100 的整数 `reliability` 和 `findings`（字段与
   `/v1/vulnerabilities/match` 的单项一致，拒绝未知字段）。先对全部 finding 的 `target` 执行范围评估，

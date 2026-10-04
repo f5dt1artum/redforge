@@ -13,6 +13,7 @@ import heapq
 import ipaddress
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,7 @@ _OBSERVATION_FIELDS = frozenset({"id", "target", "status", "headers", "body"})
 _PORT_OBSERVATION_FIELDS = frozenset(
     {"id", "target", "port", "transport", "banner"}
 )
+_DISCOVER_RECORD_FIELDS = frozenset({"id", "name", "type", "value"})
 _FINGERPRINT_FIELDS = frozenset(
     {"id", "name", "service", "priority", "logic", "matchers"}
 )
@@ -127,6 +129,9 @@ _SECURITY_HEADER_FINDING_ORDER = (
 _ASCII_DIGITS = frozenset("0123456789")
 
 SAFETY_KINDS = ("discovery", "verification", "exploitation", "credential", "privilege")
+
+RECORD_TYPES = ("A", "AAAA", "CNAME")
+MAX_DISCOVER_DEPTH = 32
 
 PRIVILEGES = ("user", "admin", "system")
 _PRIVILEGE_RANK = {name: index for index, name in enumerate(PRIVILEGES)}
@@ -516,6 +521,55 @@ def _parse_port_observation(raw: object, index: int) -> _PortObservation:
     if not isinstance(banner, str):
         raise ValueError(f"{what}.banner must be a string")
     return _PortObservation(observation_id, target, port, transport, banner)
+
+
+@dataclass(frozen=True)
+class _DiscoverRecord:
+    """A validated offline DNS record.
+
+    name is the normalized hostname the record answers for; value is the
+    parsed target the record points at (an ip entry for A/AAAA, a host
+    entry for CNAME).
+    """
+
+    id: str
+    name: str
+    type: str
+    value: _Entry
+
+
+def _parse_discover_record(raw: object, index: int) -> _DiscoverRecord:
+    what = f"records[{index}]"
+    obj = _require_fields(raw, _DISCOVER_RECORD_FIELDS, what)
+    record_id = _non_empty_str(obj["id"], f"{what}.id")
+    name = _non_empty_str(obj["name"], f"{what}.name")
+    record_type = obj["type"]
+    if record_type not in RECORD_TYPES:
+        raise ValueError(f"{what}.type must be one of {RECORD_TYPES}")
+    value = _non_empty_str(obj["value"], f"{what}.value")
+    if record_type == "CNAME":
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"{what}.value must be a hostname for CNAME")
+        hostname = _normalize_hostname(value)
+        target = _Entry("host", hostname, hostname)
+    else:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{what}.value is not a valid address: {value!r}"
+            ) from exc
+        wanted = 4 if record_type == "A" else 6
+        if address.version != wanted:
+            raise ValueError(
+                f"{what}.value address version does not match {record_type}"
+            )
+        target = _Entry("ip", str(address), address)
+    return _DiscoverRecord(record_id, _normalize_hostname(name), record_type, target)
 
 
 @dataclass(frozen=True)
@@ -1792,6 +1846,100 @@ class Service:
                 }
             )
         return service
+
+    def discover_assets(self, payload: object) -> dict[str, Any]:
+        """Expand authorized seeds through offline DNS records into assets.
+
+        Pure, local evaluation: no network access, no probing, no persistent
+        state. All structure is validated first (including duplicate record
+        ids and seeds that normalize to the same target); only then are the
+        seeds and the targets actually reached within max_depth checked
+        against the allow/deny scope. Raises ValueError on malformed input
+        and ScopeViolationError when any reached target is out of scope;
+        never returns partial results.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "seeds", "records", "max_depth"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        max_depth = payload["max_depth"]
+        if not _is_int(max_depth) or not 0 <= max_depth <= MAX_DISCOVER_DEPTH:
+            raise ValueError(
+                f"max_depth must be an integer between 0 and {MAX_DISCOVER_DEPTH}"
+            )
+
+        raw_seeds = payload["seeds"]
+        if not isinstance(raw_seeds, list):
+            raise ValueError("field seeds must be an array")
+        seeds: list[_Entry] = []
+        seen_seeds: set[str] = set()
+        for index, raw in enumerate(raw_seeds):
+            entry = _parse_entry(raw, allow_wildcard=False)
+            if entry.kind == "network":
+                raise ValueError(f"seeds[{index}] must not be a network range")
+            if entry.text in seen_seeds:
+                raise ValueError(f"duplicate seed: {entry.text!r}")
+            seen_seeds.add(entry.text)
+            seeds.append(entry)
+
+        raw_records = payload["records"]
+        if not isinstance(raw_records, list):
+            raise ValueError("field records must be an array")
+        records = [
+            _parse_discover_record(raw, i) for i, raw in enumerate(raw_records)
+        ]
+        self._require_unique_ids((record.id for record in records), "record")
+
+        # Breadth-first expansion: the first discovery of a normalized
+        # target wins, which is both the shortest path and, among
+        # equal-length paths, the one found first in seeds/records order.
+        records_by_name: dict[str, list[_DiscoverRecord]] = {}
+        for record in records:
+            records_by_name.setdefault(record.name, []).append(record)
+        reached: list[tuple[_Entry, int, str | None, str | None]] = []
+        seen: set[str] = set()
+        queue: deque[tuple[_Entry, int, str | None, str | None]] = deque()
+        for seed in seeds:
+            seen.add(seed.text)
+            queue.append((seed, 0, None, None))
+        while queue:
+            entry, depth, source, record_id = queue.popleft()
+            reached.append((entry, depth, source, record_id))
+            if entry.kind != "host" or depth >= max_depth:
+                continue
+            for record in records_by_name.get(entry.text, ()):
+                child = record.value
+                if child.text in seen:
+                    continue
+                seen.add(child.text)
+                queue.append((child, depth + 1, entry.text, record.id))
+
+        # Scope gate: only seeds and discovered targets participate; record
+        # values never reached are not evaluated. One rejection voids all.
+        self._assert_targets_in_scope(
+            (entry for entry, _, _, _ in reached), allow_rules, deny_rules
+        )
+
+        assets = [
+            {
+                "target": entry.text,
+                "kind": "hostname" if entry.kind == "host" else "ip",
+                "depth": depth,
+                "source": source,
+                "record_id": record_id,
+            }
+            for entry, depth, source, record_id in reached
+        ]
+        return {"assets": assets}
 
     def consolidate_findings(self, payload: object) -> dict[str, Any]:
         """Consolidate matched findings collected across multiple scans.
