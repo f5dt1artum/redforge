@@ -27,6 +27,7 @@ SAFETY_EVALUATE_PATH = "/v1/exercises/safety-evaluate"
 AUDIT_BUILD_PATH = "/v1/audit/build"
 AUDIT_VERIFY_PATH = "/v1/audit/verify"
 WEB_SECURITY_PATH = "/v1/web/security-analyze"
+WEB_REDIRECT_PATH = "/v1/web/redirect-analyze"
 POST_PATHS = (
     SCOPE_PATH,
     MATCH_PATH,
@@ -46,6 +47,7 @@ POST_PATHS = (
     AUDIT_BUILD_PATH,
     AUDIT_VERIFY_PATH,
     WEB_SECURITY_PATH,
+    WEB_REDIRECT_PATH,
 )
 MAX_BODY_BYTES = 1024 * 1024
 
@@ -144,6 +146,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == WEB_SECURITY_PATH:
             self._handle_json_post(self.service.analyze_web_security)
+            return
+        if self.path == WEB_REDIRECT_PATH:
+            self._handle_json_post(self.service.analyze_web_redirect)
             return
         self.not_found()
 

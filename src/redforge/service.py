@@ -100,6 +100,9 @@ _SAFETY_ACTION_FIELDS = frozenset({"id", "target", "kind", "scheduled_ms"})
 _AUDIT_EVENT_FIELDS = frozenset({"id", "target", "kind", "outcome", "occurred_ms"})
 _AUDIT_FIELDS = frozenset({"exercise_id", "records", "head_hash"})
 _WEB_OBSERVATION_FIELDS = frozenset({"id", "target", "scheme", "headers"})
+_REDIRECT_OBSERVATION_FIELDS = frozenset(
+    {"id", "target", "scheme", "request_path", "status", "location", "canary_url"}
+)
 _DISCOVER_RECORD_FIELDS = frozenset({"id", "name", "type", "value"})
 _AUDIT_RECORD_FIELDS = frozenset(
     {
@@ -121,6 +124,10 @@ RATE_LIMIT_GROUPINGS = ("target", "target_route")
 # Categories analyzable by the offline web-response security analyzer.
 WEB_SECURITY_CHECKS = ("cors", "cookie", "security_headers")
 WEB_SCHEMES = ("http", "https")
+
+# Redirect statuses that carry an actionable Location header.
+WEB_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 # DNS record types accepted by the offline asset-discovery endpoint.
 DISCOVER_RECORD_TYPES = ("A", "AAAA", "CNAME")
@@ -1404,6 +1411,435 @@ def _parse_web_observation(raw: object, index: int) -> _WebObservation:
                 )
         headers[name] = tuple(values)
     return _WebObservation(observation_id, target, scheme, headers)
+
+
+@dataclass(frozen=True)
+class _ParsedUrl:
+    """A parsed absolute http(s) URL.
+
+    host is the normalized lowercase IDNA hostname or the compressed IP
+    literal; port is None for an omitted/empty port (which compares equal to
+    the scheme default); path is the decoded-then-rendered path; query is
+    the rendered query without '?' (None when absent).
+    """
+
+    scheme: str
+    host: str
+    port: int | None
+    path: str
+    query: str | None
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_UNRESERVED_OR_SUBDELIM = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    "!$&'()*+,;="
+)
+_PCHAR_EXTRA = frozenset(":@")
+_PATH_ALLOWED = _UNRESERVED_OR_SUBDELIM | _PCHAR_EXTRA
+_QUERY_ALLOWED = _PATH_ALLOWED | frozenset("/?")
+
+
+def _percent_decode(text: str) -> str:
+    """Decode valid percent-encodings as raw UTF-8 bytes; malformed stays.
+
+    Invalid percent escapes and bytes that are not valid UTF-8 are left
+    untouched (the literal '%' sequence is preserved) so resolution never
+    raises on odd input.
+    """
+    pieces: list[str] = []
+    raw = bytearray()
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if (
+            char == "%"
+            and index + 2 < length
+            and text[index + 1] in _HEX_DIGITS
+            and text[index + 2] in _HEX_DIGITS
+        ):
+            raw.append(int(text[index + 1 : index + 3], 16))
+            index += 3
+        else:
+            if raw:
+                try:
+                    pieces.append(raw.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pieces.append("".join(f"%{byte:02X}" for byte in raw))
+                raw.clear()
+            pieces.append(char)
+            index += 1
+    if raw:
+        try:
+            pieces.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            pieces.append("".join(f"%{byte:02X}" for byte in raw))
+    return "".join(pieces)
+
+
+def _percent_encode(text: str, allowed: frozenset[str]) -> str:
+    """Percent-encode every character outside ``allowed`` via UTF-8 bytes."""
+    pieces: list[str] = []
+    for char in text:
+        if char in allowed:
+            pieces.append(char)
+        else:
+            pieces.extend(f"%{byte:02X}" for byte in char.encode("utf-8"))
+    return "".join(pieces)
+
+
+def _normalize_path_segment(segment: str) -> str:
+    return _percent_encode(_percent_decode(segment), _PATH_ALLOWED)
+
+
+def _normalize_query(query: str) -> str:
+    return _percent_encode(_percent_decode(query), _QUERY_ALLOWED)
+
+
+def _is_dot_segment(segment: str) -> str | None:
+    """Classify an encoded path segment as '.', '..', or neither.
+
+    Returns '.' or '..' for plain or ASCII-case-insensitive percent-encoded
+    dot segments (matching browser URL parsers); None otherwise.
+    """
+    if segment in (".", ".."):
+        return segment
+    lowered = segment.lower()
+    if lowered == "%2e":
+        return "."
+    if lowered == "%2e%2e":
+        return ".."
+    return None
+
+
+def _normalize_path(path: str) -> str:
+    """Remove dot segments and percent-normalize a raw (still encoded) path.
+
+    Segments are split on literal '/'; a percent-encoded slash (%2F) stays
+    inside its segment and never splits it.
+    """
+    segments = path.split("/")
+    stack: list[str] = []
+    for segment in segments:
+        dot = _is_dot_segment(segment)
+        if dot == "..":
+            # The leading empty segment marks the absolute root and is never
+            # popped, so a run of '..' at root still yields an absolute path.
+            if stack and stack != [""]:
+                stack.pop()
+        elif dot == ".":
+            continue
+        else:
+            stack.append(segment and _normalize_path_segment(segment))
+    result = "/".join(stack)
+    if path.startswith("/") and not result.startswith("/"):
+        result = "/" + result
+    if path.endswith("/") and not result.endswith("/"):
+        result += "/"
+    return result or "/"
+
+
+def _split_authority(
+    authority: str, what: str
+) -> tuple[str, str | None, str | None]:
+    """Split an authority into (raw_host, port_text, userinfo)."""
+    userinfo: str | None = None
+    rest = authority
+    if "@" in authority:
+        userinfo, _, rest = authority.rpartition("@")
+        if not userinfo or not rest:
+            raise ValueError(f"{what} has a malformed authority")
+    host = rest
+    port_text: str | None = None
+    if rest.startswith("["):
+        end = rest.find("]")
+        if end == -1:
+            raise ValueError(f"{what} has a malformed IPv6 host")
+        host = rest[: end + 1]
+        tail = rest[end + 1 :]
+        if tail:
+            if not tail.startswith(":"):
+                raise ValueError(f"{what} has a malformed authority")
+            port_text = tail[1:]
+    elif rest.count(":") > 1:
+        raise ValueError(f"{what} has a malformed authority")
+    elif ":" in rest:
+        host, _, port_text = rest.rpartition(":")
+    return host, port_text, userinfo
+
+
+def _parse_http_url(text: str, what: str) -> _ParsedUrl:
+    """Parse an absolute http(s) URL without userinfo or fragment.
+
+    Raises ValueError on anything that is not a well-formed absolute http
+    or https URL. Paths and queries are normalized through decode/re-encode
+    with dot-segment removal.
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError(f"{what} must be a non-empty string")
+    if any(ord(char) < 0x21 or ord(char) == 0x7F for char in text):
+        raise ValueError(f"{what} contains control or whitespace characters")
+    scheme, sep, rest = text.partition("://")
+    if not sep or not scheme or not rest:
+        raise ValueError(f"{what} must be an absolute http(s) URL")
+    lowered_scheme = scheme.lower()
+    if lowered_scheme not in ("http", "https") or not scheme.isascii() or not all(
+        char.isalnum() or char in "+-." for char in scheme
+    ):
+        raise ValueError(f"{what} must use http or https")
+    authority = rest
+    hier = "/"
+    for delimiter in ("/", "?", "#"):
+        index = rest.find(delimiter)
+        if index != -1:
+            authority = rest[:index]
+            hier = rest[index:]
+            break
+    if not authority:
+        raise ValueError(f"{what} has an empty authority")
+    if "#" in hier:
+        raise ValueError(f"{what} must not contain a fragment")
+    raw_host, port_text, userinfo = _split_authority(authority, what)
+    if userinfo is not None:
+        raise ValueError(f"{what} must not contain user info")
+    if hier.startswith("?"):
+        path = "/"
+        query_text = hier[1:]
+    else:
+        path, sep, query_text = hier.partition("?")
+    port: int | None = None
+    if port_text is not None:
+        if not port_text:
+            raise ValueError(f"{what} has a malformed port")
+        if not port_text.isascii() or not port_text.isdigit():
+            raise ValueError(f"{what} has a malformed port")
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError(f"{what} port must be between 1 and 65535")
+        if port == _DEFAULT_PORTS[lowered_scheme]:
+            port = None
+    host = _normalize_url_host(raw_host, what)
+    if not path.startswith("/"):
+        raise ValueError(f"{what} has a malformed path")
+    normalized_path = _normalize_path(path)
+    query: str | None = (
+        _normalize_query(query_text) if "?" in hier else None
+    )
+    return _ParsedUrl(lowered_scheme, host, port, normalized_path, query)
+
+
+def _normalize_url_host(raw_host: str, what: str) -> str:
+    """Normalize the host of an http(s) URL: IP literal or IDNA hostname."""
+    if not raw_host:
+        raise ValueError(f"{what} has an empty host")
+    if raw_host.startswith("["):
+        if not raw_host.endswith("]"):
+            raise ValueError(f"{what} has a malformed IPv6 host")
+        literal = raw_host[1:-1]
+        try:
+            address = ipaddress.ip_address(literal)
+        except ValueError as exc:
+            raise ValueError(f"{what} has a malformed IPv6 host") from exc
+        return str(address)
+    try:
+        address = ipaddress.ip_address(raw_host)
+    except ValueError:
+        pass
+    else:
+        return str(address)
+    return _normalize_hostname(raw_host)
+
+
+def _resolve_reference(base: _ParsedUrl, reference: str) -> _ParsedUrl | None:
+    """Resolve ``reference`` against ``base`` per RFC 3986 section 5.
+
+    Returns None when the reference cannot be turned into an absolute
+    http(s) URL (malformed escapes are tolerated as literal text; only
+    structural problems, bad schemes, user info or a fragment disqualify
+    it).
+    """
+    if not isinstance(reference, str) or not reference:
+        return None
+    if any(ord(char) < 0x21 or ord(char) == 0x7F for char in reference):
+        return None
+    scheme: str | None = None
+    rest = reference
+    match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", reference)
+    if match:
+        scheme = match.group(1).lower()
+        if scheme not in ("http", "https"):
+            return None
+        rest = reference[match.end() :]
+        if not rest.startswith("//"):
+            return None
+        hier, ok = _authority_hier(scheme, rest[2:])
+        if not ok or hier is None:
+            return None
+        return _finish_absolute_url(scheme, hier)
+    if rest.startswith("//"):
+        hier, ok = _authority_hier(base.scheme, rest[2:])
+        if not ok or hier is None:
+            return None
+        return _finish_absolute_url(base.scheme, hier)
+    if rest.startswith("/"):
+        return _finish_absolute_url(
+            base.scheme,
+            (base.host, base.port, rest),
+        )
+    if rest == "":
+        return _ParsedUrl(base.scheme, base.host, base.port, base.path, base.query)
+    if rest.startswith("?"):
+        merged = base.path + rest
+    else:
+        # Merge relative path against the base path (RFC 3986 5.3); base
+        # paths always contain at least the root slash.
+        merged = base.path[: base.path.rfind("/") + 1] + rest
+    return _finish_absolute_url(base.scheme, (base.host, base.port, merged))
+
+
+def _authority_hier(
+    scheme: str, text: str
+) -> tuple[tuple[str, int | None, str] | None, bool]:
+    """Split 'authority/path?query' from a reference with a network part."""
+    authority = text
+    hier = "/"
+    for delimiter in ("/", "?"):
+        index = text.find(delimiter)
+        if index != -1:
+            authority = text[:index]
+            hier = text[index:]
+            break
+    if not authority or "@" in authority:
+        return None, False
+    try:
+        raw_host, port_text, _ = _split_authority(authority, "location")
+        host = _normalize_url_host(raw_host, "location")
+        port = _parse_port_text(port_text)
+    except ValueError:
+        return None, False
+    return (host, port, hier), True
+
+
+def _parse_port_text(port_text: str | None) -> int | None:
+    if port_text is None:
+        return None
+    if not port_text or not port_text.isdigit():
+        raise ValueError("malformed port")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("port out of range")
+    return port
+
+
+def _finish_absolute_url(
+    scheme: str, parts: tuple[str, int | None, str]
+) -> _ParsedUrl | None:
+    host, port, hier = parts
+    if "#" in hier:
+        return None
+    if port is not None and port == _DEFAULT_PORTS[scheme]:
+        port = None
+    if hier.startswith("?"):
+        path = "/"
+        query_text = hier[1:]
+        has_query = True
+    else:
+        path, sep, query_text = hier.partition("?")
+        has_query = bool(sep)
+        if not path:
+            path = "/"
+    if not path.startswith("/"):
+        return None
+    normalized_path = _normalize_path(path)
+    query = _normalize_query(query_text) if has_query else None
+    return _ParsedUrl(scheme, host, port, normalized_path, query)
+
+
+def _same_origin(left: _ParsedUrl, right: _ParsedUrl) -> bool:
+    if left.scheme != right.scheme:
+        return False
+    if left.host != right.host:
+        return False
+    left_port = left.port or _DEFAULT_PORTS[left.scheme]
+    right_port = right.port or _DEFAULT_PORTS[right.scheme]
+    return left_port == right_port
+
+
+def _urls_equal(left: _ParsedUrl, right: _ParsedUrl) -> bool:
+    """Exact match: scheme/host case-insensitive, default ports equivalent,
+    path and query case-sensitive."""
+    return (
+        _same_origin(left, right)
+        and left.path == right.path
+        and left.query == right.query
+    )
+
+
+def _render_url(url: _ParsedUrl) -> str:
+    """Serialize a parsed URL, bracketing IPv6 hosts and omitting defaults."""
+    host = f"[{url.host}]" if ":" in url.host else url.host
+    rendered = f"{url.scheme}://{host}"
+    if url.port is not None:
+        rendered += f":{url.port}"
+    rendered += url.path
+    if url.query is not None:
+        rendered += "?" + url.query
+    return rendered
+
+
+@dataclass(frozen=True)
+class _RedirectObservation:
+    """A validated offline redirect-response observation.
+
+    target is the parsed scope entry (never a wildcard); its text attribute
+    is the normalized host form used to build the request URL and reported
+    back in findings. request_path starts with '/' and never contains a
+    fragment; location is the raw Location header value or None; canary is
+    the parsed canary URL.
+    """
+
+    id: str
+    target: _Entry
+    scheme: str
+    request_path: str
+    status: int
+    location: str | None
+    canary: "_ParsedUrl"
+
+
+def _parse_redirect_observation(raw: object, index: int) -> _RedirectObservation:
+    what = f"observations[{index}]"
+    obj = _require_fields(raw, _REDIRECT_OBSERVATION_FIELDS, what)
+    observation_id = _non_empty_str(obj["id"], f"{what}.id")
+    target = _parse_entry(obj["target"], allow_wildcard=False)
+    scheme = obj["scheme"]
+    if scheme not in WEB_SCHEMES:
+        raise ValueError(f"{what}.scheme must be one of {WEB_SCHEMES}")
+    request_path = obj["request_path"]
+    if not isinstance(request_path, str) or not request_path.startswith("/"):
+        raise ValueError(f"{what}.request_path must be a string starting with '/'")
+    if "#" in request_path:
+        raise ValueError(f"{what}.request_path must not contain a fragment")
+    status = obj["status"]
+    if not _is_int(status) or not 100 <= status <= 599:
+        raise ValueError(f"{what}.status must be an integer between 100 and 599")
+    location = obj["location"]
+    if location is not None and not isinstance(location, str):
+        raise ValueError(f"{what}.location must be a string or null")
+    raw_canary = obj["canary_url"]
+    if not isinstance(raw_canary, str) or not raw_canary:
+        raise ValueError(f"{what}.canary_url must be a non-empty string")
+    canary = _parse_http_url(raw_canary, f"{what}.canary_url")
+    return _RedirectObservation(
+        observation_id,
+        target,
+        scheme,
+        request_path,
+        status,
+        location,
+        canary,
+    )
 
 
 @dataclass(frozen=True)
@@ -4084,4 +4520,86 @@ class Service:
             for value in Service._header_values_ci(
                 headers, "x-content-type-options"
             )
+        )
+
+    def analyze_web_redirect(self, payload: object) -> dict[str, Any]:
+        """Analyze offline redirect responses for open redirects.
+
+        Pure, local evaluation: no network access, no payload execution and
+        no persistent state. All structure is validated first (including
+        duplicate observation ids and malformed scope rules/canary URLs);
+        only then are observation targets checked against the allow/deny
+        scope. Raises ValueError on malformed input and ScopeViolationError
+        when any target is out of scope; never returns partial results.
+        Malformed Location values merely fail to match and never fail the
+        request; the same input always produces the same findings.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        required = {"allow", "deny", "observations"}
+        keys = set(payload)
+        missing = required - keys
+        if missing:
+            raise ValueError(f"missing field: {sorted(missing)[0]}")
+        extra = keys - required
+        if extra:
+            raise ValueError(f"unknown field: {sorted(extra)[0]}")
+
+        allow_rules, deny_rules = self._parse_scope_rules(payload)
+
+        raw_observations = payload["observations"]
+        if not isinstance(raw_observations, list):
+            raise ValueError("field observations must be an array")
+        observations = [
+            _parse_redirect_observation(raw, i)
+            for i, raw in enumerate(raw_observations)
+        ]
+        self._require_unique_ids(
+            (observation.id for observation in observations), "observation"
+        )
+
+        # Scope gate: every observation target must be authorized before any
+        # analysis happens; a single rejection voids the whole request.
+        self._assert_targets_in_scope(
+            (observation.target for observation in observations),
+            allow_rules,
+            deny_rules,
+        )
+
+        findings: list[dict[str, Any]] = []
+        for observation in observations:
+            if (
+                observation.status not in WEB_REDIRECT_STATUSES
+                or not observation.location
+            ):
+                continue
+            base = self._redirect_request_url(observation)
+            destination = _resolve_reference(base, observation.location)
+            if destination is None:
+                continue
+            if not _urls_equal(destination, observation.canary):
+                continue
+            if _same_origin(base, destination):
+                continue
+            findings.append(
+                {
+                    "observation_id": observation.id,
+                    "target": observation.target.text,
+                    "category": "open_redirect",
+                    "severity": "high",
+                    "destination": _render_url(destination),
+                }
+            )
+        return {"findings": findings}
+
+    @staticmethod
+    def _redirect_request_url(observation: _RedirectObservation) -> _ParsedUrl:
+        """Build the normalized request URL a redirect was observed on."""
+        raw_path, sep, raw_query = observation.request_path.partition("?")
+        return _ParsedUrl(
+            observation.scheme,
+            observation.target.text,
+            None,
+            _normalize_path(raw_path),
+            _normalize_query(raw_query) if sep else None,
         )
