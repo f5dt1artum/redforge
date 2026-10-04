@@ -196,21 +196,30 @@ PYTHONPATH=src python3 -m redforge.server --host 127.0.0.1 --port 8080
   `reason`，`reason` 唯一取 `sequence_mismatch`、`previous_hash_mismatch`、`hash_mismatch`、
   `head_hash_mismatch`，其中 `head_hash_mismatch` 的 `index` 等于 records 长度（空链为 0）。结构问题
   始终返回 400，链内容不一致返回 200 且 `valid` 为 `false`；相同输入始终产生相同结果。
-- `POST /v1/web/security-analyze`：离线分析 HTTP 响应观测中的 CORS 与 Cookie 安全问题，不联网、
+- `POST /v1/web/security-analyze`：离线分析 HTTP 响应观测中的 CORS、Cookie 与安全响应头问题，不联网、
   不持久化。请求体仅含 `allow`、`deny`、`checks`、`observations`；`checks` 为非空、无重复的
-  数组，元素仅可为 `cors`、`cookie`；`observations` 可为空数组，每项仅含唯一非空 `id`、沿用既有
+  数组，元素仅可为 `cors`、`cookie`、`security_headers`；`observations` 可为空数组，每项仅含唯一非空 `id`、沿用既有
   目标语法且不得为通配符的 `target`、`scheme`（仅 `http` 或 `https`）和 `headers`（头名到非空
-  字符串数组的对象，头名不区分大小写）。先完成全部结构校验（字段缺失或多余、类型或值非法、重复
+  字符串数组的对象，头名不区分大小写，同名头的所有值均参与判断）。先完成全部结构校验（字段缺失或多余、类型或值非法、重复
   `id` 或 check 均返回 400 `invalid_request`），再按既有 allow/deny 语义检查每个观测的规范化
   `target`，任一越界则整体返回 403 `scope_violation`，不返回局部结果。仅分析 `checks` 指定类别：
   `cors` 在 `Access-Control-Allow-Origin` 含 `*` 且 `Access-Control-Allow-Credentials` 含忽略大小写
   的 `true` 时产生 `cors_wildcard_credentials`（severity 为 high）；`cookie` 逐个检查
   `Set-Cookie`，https 响应缺少 `Secure` 产生 `cookie_missing_secure`、缺少 `HttpOnly` 产生
   `cookie_missing_httponly`（severity 均为 medium，属性名不区分大小写）；一个 Cookie 同时缺少两项
-  时产生两个 finding，http 响应不检查 `Secure` 但仍检查 `HttpOnly`。成功响应仅含 `findings`，按
-  observations、checks 顺序排列，cookie 类再按 `Set-Cookie` 值及 Secure、HttpOnly 顺序；每项仅含
+  时产生两个 finding，http 响应不检查 `Secure` 但仍检查 `HttpOnly`；`security_headers` 按
+  HSTS、CSP、点击劫持、MIME 嗅探的固定顺序输出适用 finding：https 观测仅在某个
+  `Strict-Transport-Security` 值按分号切分后含 `max-age` 指令、且等号右侧为大于零整数的纯 ASCII
+  十进制数字时有效，否则产生 high 级 `hsts_missing_or_invalid`（http 不检查 HSTS）；不存在去除首尾
+  空白后非空的 `Content-Security-Policy` 值时产生 medium 级 `csp_missing`；任一
+  `X-Frame-Options` 值去空白后等于 `DENY` 或 `SAMEORIGIN`（大小写不敏感），或任一
+  `Content-Security-Policy` 值含带非空参数的 `frame-ancestors` 指令时视为有点击劫持防护，否则产生
+  medium 级 `clickjacking_unprotected`；任一 `X-Content-Type-Options` 值去空白后等于 `nosniff`
+  时有效，否则产生 low 级 `nosniff_missing`；格式异常的头值仅视为无效，不使请求失败。成功响应仅含
+  `findings`，按 observations、checks 顺序排列，security_headers 类内部按上述固定顺序，cookie 类再按
+  `Set-Cookie` 值及 Secure、HttpOnly 顺序；每项仅含
   `observation_id`、规范化 `target`、`category`（即上述 finding 代码）、`severity`、
-  `cookie_name`（cors 为 `null`，cookie 类取首个等号前原文，不回显完整 Cookie）。空 `observations`
+  `cookie_name`（cors 与 security_headers 为 `null`，cookie 类取首个等号前原文，不回显完整 Cookie）。空 `observations`
   或无命中返回空 `findings`，相同输入始终产生相同结果。
 
 ## 验证

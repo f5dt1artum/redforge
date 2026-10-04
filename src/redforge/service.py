@@ -114,8 +114,17 @@ _ZERO_HASH = "0" * 64
 RATE_LIMIT_GROUPINGS = ("target", "target_route")
 
 # Categories analyzable by the offline web-response security analyzer.
-WEB_SECURITY_CHECKS = ("cors", "cookie")
+WEB_SECURITY_CHECKS = ("cors", "cookie", "security_headers")
 WEB_SCHEMES = ("http", "https")
+
+# Fixed emission order of the findings produced by one security_headers run.
+_SECURITY_HEADER_FINDING_ORDER = (
+    ("hsts_missing_or_invalid", "high"),
+    ("csp_missing", "medium"),
+    ("clickjacking_unprotected", "medium"),
+    ("nosniff_missing", "low"),
+)
+_ASCII_DIGITS = frozenset("0123456789")
 
 SAFETY_KINDS = ("discovery", "verification", "exploitation", "credential", "privilege")
 
@@ -3348,7 +3357,7 @@ class Service:
         }
 
     def analyze_web_security(self, payload: object) -> dict[str, Any]:
-        """Analyze offline HTTP response observations for CORS/cookie issues.
+        """Analyze offline HTTP response observations for security issues.
 
         Pure, local evaluation: no network access and no persistent state.
         All structure is validated first (including duplicate observation and
@@ -3419,8 +3428,10 @@ class Service:
                                 "cookie_name": None,
                             }
                         )
-                else:
+                elif check == "cookie":
                     findings.extend(self._cookie_findings(observation))
+                else:
+                    findings.extend(self._security_header_findings(observation))
         return {"findings": findings}
 
     @staticmethod
@@ -3493,3 +3504,115 @@ class Service:
                 for category in categories
             )
         return findings
+
+    @classmethod
+    def _security_header_findings(
+        cls, observation: _WebObservation
+    ) -> list[dict[str, Any]]:
+        """HSTS, CSP, clickjacking and MIME-sniffing findings, fixed order.
+
+        Every value of a repeated header participates; malformed header
+        values merely fail their check and never make the request fail.
+        HSTS is evaluated for https observations only.
+        """
+        headers = observation.headers
+        missing = {
+            "hsts_missing_or_invalid": (
+                observation.scheme == "https" and not cls._hsts_effective(headers)
+            ),
+            "csp_missing": not cls._csp_present(headers),
+            "clickjacking_unprotected": not (
+                cls._xfo_protects(headers)
+                or cls._frame_ancestors_protects(headers)
+            ),
+            "nosniff_missing": not cls._nosniff_present(headers),
+        }
+        return [
+            {
+                "observation_id": observation.id,
+                "target": observation.target.text,
+                "category": category,
+                "severity": severity,
+                "cookie_name": None,
+            }
+            for category, severity in _SECURITY_HEADER_FINDING_ORDER
+            if missing[category]
+        ]
+
+    @staticmethod
+    def _hsts_effective(headers: dict[str, tuple[str, ...]]) -> bool:
+        """Whether any Strict-Transport-Security value enables HSTS.
+
+        The value is split on semicolons; a directive named max-age
+        (case-insensitive, whitespace-trimmed) is effective only when the
+        text right of '=' consists solely of ASCII decimal digits, at least
+        one of them non-zero. Anything else, including missing '=' or
+        surrounding whitespace on the age, is treated as malformed. The
+        numeric test is purely lexical so even an oversized digit run cannot
+        raise.
+        """
+        for value in Service._header_values_ci(
+            headers, "strict-transport-security"
+        ):
+            for directive in value.split(";"):
+                name, sep, raw_age = directive.partition("=")
+                if not sep or name.strip().lower() != "max-age":
+                    continue
+                if (
+                    raw_age
+                    and all(char in _ASCII_DIGITS for char in raw_age)
+                    and any(char != "0" for char in raw_age)
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _csp_present(headers: dict[str, tuple[str, ...]]) -> bool:
+        """Whether any Content-Security-Policy value is non-empty when trimmed."""
+        return any(
+            bool(value.strip())
+            for value in Service._header_values_ci(
+                headers, "content-security-policy"
+            )
+        )
+
+    @staticmethod
+    def _xfo_protects(headers: dict[str, tuple[str, ...]]) -> bool:
+        """Whether any X-Frame-Options value is DENY or SAMEORIGIN."""
+        return any(
+            value.strip().upper() in ("DENY", "SAMEORIGIN")
+            for value in Service._header_values_ci(headers, "x-frame-options")
+        )
+
+    @staticmethod
+    def _frame_ancestors_protects(headers: dict[str, tuple[str, ...]]) -> bool:
+        """Whether any CSP value carries frame-ancestors with a non-empty arg.
+
+        Directives are split on semicolons; the directive name is the first
+        whitespace-delimited token (case-insensitive) and anything after it
+        must contain a non-whitespace character. Report-Only policies are not
+        considered.
+        """
+        for value in Service._header_values_ci(
+            headers, "content-security-policy"
+        ):
+            for directive in value.split(";"):
+                pieces = directive.split(None, 1)
+                if (
+                    pieces
+                    and pieces[0].lower() == "frame-ancestors"
+                    and len(pieces) == 2
+                    and pieces[1].strip()
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _nosniff_present(headers: dict[str, tuple[str, ...]]) -> bool:
+        """Whether any X-Content-Type-Options value is exactly nosniff."""
+        return any(
+            value.strip().lower() == "nosniff"
+            for value in Service._header_values_ci(
+                headers, "x-content-type-options"
+            )
+        )
